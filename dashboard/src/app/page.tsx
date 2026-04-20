@@ -46,13 +46,11 @@ export default function Page() {
     return () => clearInterval(id);
   }, [refreshAll, nodes]);
 
-  // Fetch enabled model library from first responding node
+  // Fetch enabled model library from first online node
   const refreshLibrary = useCallback(() => {
-    for (const node of nodes) {
-      createNodeApi(node).library().then(setLibrary).catch(() => {});
-      break;
-    }
-  }, [nodes]);
+    const firstOnline = nodeStatuses.find(ns => !!ns.status)?.node ?? nodes[0];
+    if (firstOnline) createNodeApi(firstOnline).library().then(setLibrary).catch(() => {});
+  }, [nodeStatuses, nodes]);
 
   useEffect(() => { refreshLibrary(); }, [refreshLibrary]);
 

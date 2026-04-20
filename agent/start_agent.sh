@@ -32,7 +32,8 @@ echo "  Log: $LOG_FILE"
 
 sleep 2
 if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "Agent running — http://$(hostname -I | awk '{print $1}'):$PORT"
+    DISPLAY_IP="${AGENT_BIND_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+    echo "Agent running — http://${DISPLAY_IP}:$PORT"
 else
     echo "ERROR: Agent failed to start. Check $LOG_FILE"
     rm -f "$PID_FILE"

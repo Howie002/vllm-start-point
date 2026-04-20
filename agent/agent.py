@@ -34,8 +34,7 @@ STACK_CONFIGS_PATH = Path(__file__).parent.parent / "stack_configs.json"
 HF_CACHE       = Path.home() / ".cache" / "huggingface" / "hub"
 CUDA_ENV = {
     **os.environ,
-    "PATH": "/usr/local/cuda-12.8/bin:/usr/local/cuda/bin:" + os.environ.get("PATH", ""),
-    "PATH": f"{Path.home()}/.vllm-venv/bin:/usr/local/cuda-12.8/bin:/usr/local/cuda/bin:" + os.environ.get("PATH", ""),
+    "PATH": f"{Path.home()}/.vllm-venv/bin:/usr/local/cuda-12.8/bin:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
 }
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -581,14 +580,12 @@ def stop_instance(port: int, deregister: bool = True):
     except psutil.NoSuchProcess:
         pass
 
-    # Deregister from LiteLLM
+    # Deregister from LiteLLM (POST /model/delete with model name in body)
     if deregister and served_name:
-        _http_delete(
+        _http_post(
             f"{LITELLM_URL}/model/delete",
-            headers={
-                "Authorization": f"Bearer {LITELLM_KEY}",
-                "Content-Type": "application/json",
-            }
+            data={"id": served_name},
+            headers={"Authorization": f"Bearer {LITELLM_KEY}"},
         )
 
     return {"stopped": True, "port": port, "pid": pid}

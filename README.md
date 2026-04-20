@@ -1,33 +1,30 @@
 # vLLM Stack
 
-Self-hosted AI inference across one or more GPU machines. All models are served through an OpenAI-compatible API — drop-in replacement for cloud endpoints with no per-token cost and no data leaving the network.
+Self-hosted AI inference across one or more GPU machines. All models served through an OpenAI-compatible API — drop-in replacement for cloud endpoints with no per-token cost and no data leaving the network.
 
 ---
 
 ## Quick Start
 
-### First machine (or only machine)
+### Single machine (GPU + dashboard on same box)
 
 ```bash
 git clone <repo>
 cd <repo>
-./node.sh
+./node.sh        # choose role: both
 ```
 
-The script will ask three questions (role, IP, ports), install all dependencies, and start everything.
+The script asks for role, IP, and ports, installs all dependencies, and starts everything.
 
 ### Adding a second GPU machine
 
 On the **new machine**:
 ```bash
-./node.sh          # choose role: child
-                   # enter master IP when prompted
+./node.sh        # choose role: child
+                 # enter master IP when prompted
 ```
 
-On the **master**:
-```bash
-./node.sh add-node   # enter the new machine's IP
-```
+On the **master**, open the dashboard → click **+ Add node** → follow the on-screen instructions. The dashboard generates the exact setup command needed on the child machine.
 
 ---
 
@@ -35,9 +32,11 @@ On the **master**:
 
 | Role | What runs | Use when |
 |---|---|---|
-| `master` | Dashboard only | Dedicated VM / management box |
-| `child` | vLLM inference + control agent | GPU server |
-| `both` | Everything | Single machine with GPU |
+| `both` | vLLM + agent + dashboard | Single GPU machine |
+| `master` | Dashboard only | Dedicated management VM (no GPU) |
+| `child` | vLLM + control agent | Additional GPU server |
+
+Child nodes run their own dashboard instance too, showing the full cluster (master + siblings) — not just their own GPUs.
 
 ---
 
@@ -61,34 +60,40 @@ On the **master**:
                             │
                             ▼
                ┌────────────────────────┐
-               │   Dashboard  :3000     │  ← master node (VM or any machine)
+               │   Dashboard  :3000     │  ← any node (master or child)
                └────────────────────────┘
-                            │  queries each child agent directly
-                            ▼
-            ┌───────────────────────────────┐
-            │  Control Agent  :5000         │  ← each GPU machine
-            │  FastAPI — GPU stats,         │
-            │  instance mgmt, proxy mgmt    │
-            └───────────────────────────────┘
+                    │           │
+          polls each agent      │ fetches node list from master
+                    ▼           ▼
+            ┌──────────────────────────────┐
+            │  Control Agent  :5000        │  ← each GPU machine
+            │  GPU stats, instance mgmt,   │
+            │  model library, proxy mgmt   │
+            └──────────────────────────────┘
                             │
                ┌────────────┴────────────┐
                ▼                         ▼
-   ┌───────────────────┐     ┌───────────────────┐
-   │  LiteLLM  :4000   │     │  vLLM instances   │
-   │  Proxy + routing  │────▶│  :8001 :8003 :8004 │
-   └───────────────────┘     └───────────────────┘
+   ┌───────────────────┐     ┌───────────────────────┐
+   │  LiteLLM  :4000   │     │  vLLM instances       │
+   │  Proxy + routing  │────▶│  :8020 :8021 :8022 …  │
+   └───────────────────┘     └───────────────────────┘
 ```
 
-### Default GPU layout (4× RTX PRO 6000, 96 GB each)
+The master agent exposes `GET /nodes` so every node can fetch the full cluster topology. Each node's dashboard shows GPUs and instances from every registered node in one unified view.
 
-| GPU | VRAM | Static workload |
-|---|---|---|
-| 0 | 96 GB | Dynamic — LM Studio, overflow, ad-hoc |
-| 1 | 96 GB | Nemotron Nano FP8 (port 8001) + GTE-Qwen2-7B embed (port 8011) |
-| 2 | 96 GB | Nemotron Super 49B FP8 instance A (port 8003) |
-| 3 | 96 GB | Nemotron Super 49B FP8 instance B (port 8004) |
+---
 
-LiteLLM load-balances across both Super instances automatically.
+## Dashboard
+
+Access at `http://<any-node-ip>:3000`
+
+- **GPU Cluster** — all GPUs across all nodes in one flat grid, grouped by node badge per card. Click any card for temperature, power draw, clock, fan speed detail.
+- **Running Instances** — unified table of all vLLM instances with node, model, port, GPU, status. Click a row for context length, quantization, tensor parallel, endpoint URL.
+- **Node Management** — per-node agent controls (restart, stop) and stack template management.
+- **Model Library** — searchable catalog with one-click Deploy to any GPU across the cluster.
+- **Stack Templates** — saved GPU assignments with preflight checks and smart repack (bin-packing) to optimise utilisation.
+
+The dashboard can rebuild itself: **Node Management → Restart dashboard** runs `npm run build` on the machine and restarts the server in the background.
 
 ---
 
@@ -102,17 +107,11 @@ Auth:       Authorization: Bearer none
 ```
 
 ```bash
-# Chat (fast)
+# Chat
 curl http://<gpu-machine>:4000/v1/chat/completions \
   -H "Authorization: Bearer none" \
   -H "Content-Type: application/json" \
   -d '{"model": "nemotron-nano", "messages": [{"role": "user", "content": "Hello"}]}'
-
-# Chat (high quality, load balanced)
-curl http://<gpu-machine>:4000/v1/chat/completions \
-  -H "Authorization: Bearer none" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "nemotron-super", "messages": [{"role": "user", "content": "Explain transformers"}]}'
 
 # Embeddings
 curl http://<gpu-machine>:4000/v1/embeddings \
@@ -121,20 +120,34 @@ curl http://<gpu-machine>:4000/v1/embeddings \
   -d '{"model": "text-embedding", "input": "sample text"}'
 ```
 
+The vLLM instances are also directly accessible at `http://<gpu-machine>:<port>/v1` — useful for bypassing the proxy during testing.
+
+---
+
+## Special Hardware
+
+### NVIDIA DGX Spark (GB10 Grace Blackwell)
+
+The DGX Spark uses a unified 128 GB LPDDR5x memory pool shared between the CPU and GPU. `nvidia-smi` returns `Not Supported` for memory fields. The agent detects this automatically:
+
+- Falls back to `torch.cuda.mem_get_info()` for accurate GPU memory reporting
+- GPU cards in the dashboard show a **unified** badge and label the VRAM bar as `(RAM)`
+- The Deploy modal shows a note that VRAM figures represent shared system RAM
+
+vLLM on the DGX Spark requires `--enforce-eager` due to SM121 not being fully supported by compiled CUDA kernels. Set this in the model's `extra_flags` in the library.
+
 ---
 
 ## Dependencies
 
-**One-time system prerequisites** (only needed if not already installed):
+**System prerequisites** (installed automatically by `node.sh setup`):
 ```bash
 sudo apt-get install -y curl cuda-toolkit-12-8
 ```
 
-`node.sh setup` will attempt to install these automatically. If `apt-get` is unavailable, see [Four Card AI Setup.md](Four%20Card%20AI%20Setup.md) for manual steps.
+**Python venv** is created at `~/.vllm-venv` (outside the repo to avoid spaces-in-path issues with nvcc).
 
-**Python venv** is created at `~/.vllm-venv` (outside the repo) to avoid spaces-in-path issues with nvcc. It is not committed.
-
-**Node.js 20+** is required on master nodes. `node.sh setup` installs it automatically via NodeSource if missing.
+**Node.js 20+** is required on nodes that run the dashboard. `node.sh setup` installs it automatically via NodeSource if missing.
 
 ---
 
@@ -144,32 +157,39 @@ sudo apt-get install -y curl cuda-toolkit-12-8
 |---|---|
 | `node.sh` | Unified node manager — configure, install, start, stop, add nodes |
 | `setup.sh` | Idempotent Python venv + vLLM installer (called by node.sh) |
-| `start_inference_stack.sh` | Launches all vLLM instances + LiteLLM proxy |
-| `stop_inference_stack.sh` | Gracefully shuts down the inference stack |
-| `litellm_config.yaml` | LiteLLM proxy routing config |
-| `agent/agent.py` | FastAPI control agent — GPU stats, instance management, model library |
+| `agent/agent.py` | FastAPI control agent — GPU stats, instance mgmt, model library, stack configs |
+| `agent/model_library.json` | Curated model catalog with VRAM, quantization, and flag metadata |
 | `agent/start_agent.sh` / `stop_agent.sh` | Agent lifecycle scripts |
-| `dashboard/` | Next.js dashboard (multi-node, dark theme) |
+| `dashboard/` | Next.js cluster dashboard |
 | `dashboard/start_dashboard.sh` / `stop_dashboard.sh` | Dashboard lifecycle scripts |
+| `stack_configs.json` | Named stack templates with GPU/port assignments |
+| `litellm_config.yaml` | LiteLLM proxy routing and retry config |
 | `node_config.json` | Generated by `node.sh setup` — machine-specific, gitignored |
 | `logs/` | Per-service log files, created at runtime, gitignored |
-| `Four Card AI Setup.md` | Detailed hardware/software reference and implementation notes |
-
----
-
-## Dashboard
-
-The dashboard runs on the master node and shows all registered child nodes. Each node displays:
-
-- Per-GPU VRAM usage and utilization
-- Running vLLM instances with health status
-- LiteLLM proxy status and registered models
-- Model library with one-click Deploy (GPU picker, port, proxy registration)
-
-Access at `http://<master-ip>:3000`
+| `Four Card AI Setup.md` | Detailed hardware/software reference for the original 4× RTX PRO 6000 setup |
 
 ---
 
 ## Windows
 
 `start.bat` and `stop.bat` launch the stack via WSL with an nvidia-smi monitor window. They are an alternative to `node.sh` for machines where WSL is the primary interface.
+
+---
+
+## Troubleshooting
+
+**Node shows 0 GPUs / 0 VRAM**
+- nvidia-smi may be returning `Not Supported` for memory fields (unified memory hardware like DGX Spark). Update the agent — the fix is in `agent.py` as of the current version.
+- Run `nvidia-smi --query-gpu=index,name,memory.total --format=csv` on the machine to check raw output.
+
+**Agent unreachable in dashboard**
+- Check firewall: the dashboard needs TCP access to port 5000 on each child node.
+- Check the agent is running: `curl http://<node-ip>:5000/health`
+- The offline node card shows the exact `node.sh setup` command to re-run.
+
+**Port already in use on start**
+- `./node.sh status` shows what's running and on which ports.
+- `./node.sh stop` then `./node.sh start` to restart cleanly.
+
+**Dashboard not reflecting code changes**
+- The production server serves a pre-built bundle. Use **Restart dashboard** in the UI (triggers rebuild + restart), or run `npm run build && npm start` in `dashboard/` manually.

@@ -20,6 +20,7 @@ dashboard/.next/
 dashboard/node_modules/
 dashboard/.dashboard_pid
 dashboard/dashboard.log
+dashboard/tsconfig.tsbuildinfo
 
 # Agent runtime
 agent/.agent_pid

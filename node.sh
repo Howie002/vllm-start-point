@@ -361,7 +361,10 @@ PY
     if [[ "${do_install:-Y}" =~ ^[Yy]$ ]] || [ -z "$do_install" ]; then
         case "$role" in
             master) install_master_deps ;;
-            child)  install_child_deps  ;;
+            child)
+                install_child_deps
+                install_master_deps   # child also runs the dashboard (to see the full cluster)
+                ;;
             both)
                 install_child_deps
                 install_master_deps
@@ -514,7 +517,7 @@ do_start() {
 
     if [ "$role" = "child" ] || [ "$role" = "both" ]; then
         info "Starting control agent (port $agent_port)..."
-        AGENT_PORT="$agent_port" bash "$SCRIPT_DIR/agent/start_agent.sh" \
+        AGENT_PORT="$agent_port" AGENT_BIND_IP="$this_ip" bash "$SCRIPT_DIR/agent/start_agent.sh" \
             || warn "Agent start reported errors — check agent/agent.log"
     fi
 
