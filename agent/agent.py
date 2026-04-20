@@ -381,11 +381,36 @@ def health():
 
 
 def _parse_num(s: str) -> Optional[float]:
-    s = s.strip().replace("[N/A]", "").replace("N/A", "").strip()
+    s = s.strip().replace("[N/A]", "").replace("N/A", "").replace("Not Supported", "").strip()
     try:
         return float(s)
     except ValueError:
         return None
+
+
+def _unified_mem_mb(gpu_index: int) -> tuple[int, int]:
+    """Return (total_mb, free_mb) for unified-memory GPUs (e.g. DGX Spark GB10).
+    Falls back to system RAM when torch is unavailable."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_b, total_b = torch.cuda.mem_get_info(gpu_index)
+            if total_b > 0:
+                return int(total_b // (1024 * 1024)), int(free_b // (1024 * 1024))
+    except Exception:
+        pass
+    try:
+        mem = psutil.virtual_memory()
+        total_mb = int(mem.total // (1024 * 1024))
+        avail_mb = int(mem.available // (1024 * 1024))
+        return total_mb, avail_mb
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _is_not_supported(s: str) -> bool:
+    return s.strip().lower() in ("not supported", "[not supported]", "n/a", "[n/a]", "")
 
 
 @app.get("/gpus")
@@ -407,19 +432,37 @@ def get_gpus():
             continue
         try:
             idx = int(row[0])
+
+            # Handle unified memory GPUs (e.g. DGX Spark GB10) where nvidia-smi
+            # returns "Not Supported" for memory fields
+            mem_used_s  = row[2].strip()
+            mem_free_s  = row[3].strip()
+            mem_total_s = row[4].strip()
+
+            if _is_not_supported(mem_total_s):
+                total_mb, free_mb = _unified_mem_mb(idx)
+                used_mb = total_mb - free_mb
+                unified = True
+            else:
+                total_mb = int(mem_total_s)
+                used_mb  = int(mem_used_s)  if not _is_not_supported(mem_used_s)  else 0
+                free_mb  = int(mem_free_s)  if not _is_not_supported(mem_free_s)  else total_mb
+                unified = False
+
             gpus.append({
-                "index":           idx,
-                "name":            row[1].strip(),
-                "vram_used_mb":    int(row[2]),
-                "vram_free_mb":    int(row[3]),
-                "vram_total_mb":   int(row[4]),
-                "utilization_pct": int(row[5]) if row[5].strip().lstrip("-").isdigit() else 0,
-                "temperature_c":   _parse_num(row[6])  if len(row) > 6  else None,
-                "fan_speed_pct":   _parse_num(row[7])  if len(row) > 7  else None,
-                "clock_mhz":       _parse_num(row[8])  if len(row) > 8  else None,
-                "power_draw_w":    _parse_num(row[9])  if len(row) > 9  else None,
-                "power_limit_w":   _parse_num(row[10]) if len(row) > 10 else None,
-                "processes":       gpu_procs.get(idx, []),
+                "index":             idx,
+                "name":              row[1].strip(),
+                "vram_used_mb":      used_mb,
+                "vram_free_mb":      free_mb,
+                "vram_total_mb":     total_mb,
+                "unified_memory":    unified,
+                "utilization_pct":   int(row[5]) if row[5].strip().lstrip("-").isdigit() else 0,
+                "temperature_c":     _parse_num(row[6])  if len(row) > 6  else None,
+                "fan_speed_pct":     _parse_num(row[7])  if len(row) > 7  else None,
+                "clock_mhz":         _parse_num(row[8])  if len(row) > 8  else None,
+                "power_draw_w":      _parse_num(row[9])  if len(row) > 9  else None,
+                "power_limit_w":     _parse_num(row[10]) if len(row) > 10 else None,
+                "processes":         gpu_procs.get(idx, []),
             })
         except (ValueError, IndexError):
             pass
@@ -1071,23 +1114,41 @@ def dashboard_restart():
     """Kill the dashboard, rebuild, and restart it."""
     def _do():
         time.sleep(0.3)
-        # Kill existing process
+        port = os.environ.get("DASHBOARD_PORT", "3000")
+
+        # Kill by PID file first, then fall back to killing by port
         pid = _dashboard_pid()
         if pid:
             try:
                 os.kill(pid, signal.SIGTERM)
-                time.sleep(1)
             except ProcessLookupError:
                 pass
-        # Rebuild and restart
+        else:
+            # Kill whatever is holding the port (handles manual/node.sh starts)
+            try:
+                result = subprocess.run(
+                    ["lsof", "-ti", f":{port}"], capture_output=True, text=True
+                )
+                for p in result.stdout.strip().split():
+                    try:
+                        os.kill(int(p), signal.SIGTERM)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        time.sleep(2)  # wait for port to free
+
         env = {**os.environ, "PATH": f"/usr/local/bin:/usr/bin:/bin:{os.environ.get('PATH', '')}"}
-        subprocess.run(["npm", "run", "build"], cwd=str(DASHBOARD_DIR), env=env)
-        port = os.environ.get("DASHBOARD_PORT", "3000")
+        log_file = open(DASHBOARD_DIR / "dashboard.log", "w")
+        subprocess.run(["npm", "run", "build"], cwd=str(DASHBOARD_DIR), env=env,
+                       stdout=log_file, stderr=subprocess.STDOUT)
+        log_file.flush()
         proc = subprocess.Popen(
-            ["npm", "run", "start", "--", "-p", port],
+            ["npm", "run", "start"],
             cwd=str(DASHBOARD_DIR),
             env=env,
-            stdout=open(DASHBOARD_DIR / "dashboard.log", "w"),
+            stdout=log_file,
             stderr=subprocess.STDOUT,
         )
         DASHBOARD_PID_FILE.write_text(str(proc.pid))

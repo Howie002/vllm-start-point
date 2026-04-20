@@ -1,139 +1,73 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import type { FullStatus, NodeConfig, ModelEntry } from "@/lib/types";
+import { useState } from "react";
+import type { FullStatus, NodeConfig } from "@/lib/types";
 import { createNodeApi } from "@/lib/api";
-import { GPUGrid } from "./GPUGrid";
-import { ServiceList } from "./ServiceList";
-import { ModelLibrary } from "./ModelLibrary";
 import { StackConfigs } from "./StackConfigs";
-import { ModelLibraryManager } from "./ModelLibraryManager";
-
-const POLL_MS = 8000;
 
 interface Props {
   node: NodeConfig;
-  library: ModelEntry[];
-  defaultOpen?: boolean;
-  onLibraryChanged?: () => void;
+  status: FullStatus | null;
+  error: string | null;
+  onRefresh: () => void;
 }
 
-export function NodeCard({ node, library, defaultOpen = true, onLibraryChanged }: Props) {
-  const [status, setStatus]               = useState<FullStatus | null>(null);
-  const [error, setError]                 = useState<string | null>(null);
-  const [open, setOpen]                   = useState(defaultOpen);
-  const [agentBusy, setAgentBusy]         = useState<"restarting" | "stopping" | null>(null);
-  const [dashBusy, setDashBusy]           = useState<"restarting" | "stopping" | null>(null);
-  const [showLibMgr, setShowLibMgr]       = useState(false);
+export function NodeCard({ node, status, error, onRefresh }: Props) {
+  const [open, setOpen]           = useState(false);
+  const [agentBusy, setAgentBusy] = useState<"restarting" | "stopping" | null>(null);
+  const [dashBusy, setDashBusy]   = useState<"restarting" | null>(null);
 
-  const refresh = useCallback(async () => {
-    try {
-      const api = createNodeApi(node);
-      const s = await api.status();
-      setStatus(s);
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, [node]);
-
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, POLL_MS);
-    return () => clearInterval(id);
-  }, [refresh]);
+  const online = !!status && !error;
 
   async function handleRestart() {
     if (!confirm(`Restart the agent on ${node.name}? Running vLLM instances will keep running.`)) return;
     setAgentBusy("restarting");
     try {
       await createNodeApi(node).restartAgent();
-      // Wait a moment then re-poll
-      await new Promise((r) => setTimeout(r, 2000));
-      await refresh();
+      await new Promise(r => setTimeout(r, 2000));
+      await onRefresh();
     } catch {
-      // Expected — agent drops the connection during restart
-      await new Promise((r) => setTimeout(r, 3000));
-      await refresh();
+      await new Promise(r => setTimeout(r, 3000));
+      await onRefresh();
     } finally {
       setAgentBusy(null);
     }
   }
 
   async function handleStop() {
-    if (!confirm(`Stop the agent on ${node.name}? This only stops the control agent, not running vLLM instances.`)) return;
+    if (!confirm(`Stop the agent on ${node.name}? Running vLLM instances will keep running.`)) return;
     setAgentBusy("stopping");
-    try {
-      await createNodeApi(node).stopAgent();
-    } catch {
-      // Expected — connection drops immediately
-    } finally {
-      setAgentBusy(null);
-      setStatus(null);
-      setError("Agent stopped.");
-    }
+    try { await createNodeApi(node).stopAgent(); } catch { /* expected */ }
+    setAgentBusy(null);
+    onRefresh();
   }
 
   async function handleDashboardRestart() {
     if (!confirm("Rebuild and restart the dashboard? This takes ~1 minute. The page will go offline briefly.")) return;
     setDashBusy("restarting");
-    try {
-      await createNodeApi(node).restartDashboard();
-    } catch {
-      // ignore — page will reload itself
-    }
-    // Wait for build then reload
-    await new Promise((r) => setTimeout(r, 60000));
+    try { await createNodeApi(node).restartDashboard(); } catch { /* expected */ }
+    await new Promise(r => setTimeout(r, 60000));
     window.location.reload();
   }
 
-  const online = !!status && !error;
-  const totalVram = status?.gpus.reduce((a, g) => a + g.vram_total_mb, 0) ?? 0;
-  const usedVram  = status?.gpus.reduce((a, g) => a + g.vram_used_mb,  0) ?? 0;
-
   return (
-    <div className="border border-border rounded-2xl overflow-hidden">
-      {/* Node header */}
+    <div className="border border-border rounded-xl overflow-hidden">
       <button
-        className="w-full flex items-center gap-3 px-5 py-4 bg-card hover:bg-slate-800/60 transition-colors text-left"
-        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center gap-3 px-4 py-3 bg-card hover:bg-slate-800/50 transition-colors text-left"
+        onClick={() => setOpen(o => !o)}
       >
-        <span
-          className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
-            online ? "bg-emerald-400" : error ? "bg-red-500" : "bg-slate-600 animate-pulse"
-          }`}
-        />
-        <span className="font-semibold text-white">{node.name}</span>
-        <span className="text-slate-500 text-sm font-mono">
-          {node.ip}:{node.agent_port}
-        </span>
+        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+          online ? "bg-emerald-400" : error ? "bg-red-500" : "bg-slate-600 animate-pulse"
+        }`} />
+        <span className="text-sm font-medium text-white">{node.name}</span>
+        <span className="text-xs text-slate-500 font-mono">{node.ip}:{node.agent_port}</span>
 
         {online && (
-          <>
-            <span className="ml-auto text-xs text-slate-400">
-              {status!.gpus.length} GPU{status!.gpus.length !== 1 ? "s" : ""}
-            </span>
-            <span className="text-xs text-slate-500 hidden sm:inline">
-              {(usedVram / 1024).toFixed(0)}/{(totalVram / 1024).toFixed(0)} GB VRAM
-            </span>
-            <span className="text-xs text-slate-500">
-              {status!.instances.length} instance{status!.instances.length !== 1 ? "s" : ""}
-            </span>
-          </>
-        )}
-
-        {error && !agentBusy && (
-          <span className="ml-auto text-xs text-red-400">unreachable</span>
-        )}
-
-        {/* Agent + dashboard controls */}
-        {online && (
-          <div className="flex items-center gap-1 ml-auto" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center gap-1 ml-auto" onClick={e => e.stopPropagation()}>
             <button
               onClick={handleDashboardRestart}
               disabled={!!dashBusy || !!agentBusy}
               className="text-xs px-2 py-0.5 rounded text-slate-500 hover:text-emerald-400 hover:bg-slate-700/50 disabled:opacity-40 transition-colors"
-              title="Rebuild and restart dashboard (~1 min)"
             >
               {dashBusy === "restarting" ? "Building…" : "Restart dashboard"}
             </button>
@@ -142,7 +76,6 @@ export function NodeCard({ node, library, defaultOpen = true, onLibraryChanged }
               onClick={handleRestart}
               disabled={!!agentBusy || !!dashBusy}
               className="text-xs px-2 py-0.5 rounded text-slate-500 hover:text-blue-400 hover:bg-slate-700/50 disabled:opacity-40 transition-colors"
-              title="Restart agent"
             >
               {agentBusy === "restarting" ? "Restarting…" : "Restart agent"}
             </button>
@@ -150,82 +83,27 @@ export function NodeCard({ node, library, defaultOpen = true, onLibraryChanged }
               onClick={handleStop}
               disabled={!!agentBusy || !!dashBusy}
               className="text-xs px-2 py-0.5 rounded text-slate-500 hover:text-red-400 hover:bg-slate-700/50 disabled:opacity-40 transition-colors"
-              title="Stop agent"
             >
               {agentBusy === "stopping" ? "Stopping…" : "Stop agent"}
             </button>
           </div>
         )}
 
-        <span className="text-slate-600 text-sm">{open ? "▲" : "▼"}</span>
+        {!online && error && (
+          <span className="text-xs text-red-400 ml-auto">unreachable</span>
+        )}
+
+        <span className="text-slate-600 text-xs ml-2">
+          {open ? "▲" : "▼"} Stack Templates
+        </span>
       </button>
 
-      {/* Expanded content */}
       {open && (
-        <div className="p-5 space-y-6 bg-surface border-t border-border">
-          {error ? (
-            <div className="bg-red-900/20 border border-red-800 rounded-xl px-4 py-3 space-y-2">
-              <p className="text-sm text-red-400">
-                Cannot reach agent at <code className="font-mono">{node.ip}:{node.agent_port}</code>.
-              </p>
-              {node.setup_cmd ? (
-                <>
-                  <p className="text-xs text-slate-400">
-                    Run this on <span className="text-white font-medium">{node.name}</span> to bring it online:
-                  </p>
-                  <pre className="text-xs bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-emerald-300 font-mono whitespace-pre-wrap break-all select-all">
-                    {node.setup_cmd}
-                  </pre>
-                  <p className="text-xs text-slate-500">
-                    Once the agent is running, this card will connect automatically within 8 seconds.
-                  </p>
-                </>
-              ) : (
-                <p className="text-xs text-slate-500">
-                  Ensure <code className="font-mono">./node.sh start</code> has been run on that machine.
-                </p>
-              )}
-            </div>
-          ) : status ? (
-            <>
-              <GPUGrid gpus={status.gpus} instances={status.instances} />
-              <ServiceList
-                instances={status.instances}
-                proxy={status.proxy}
-                node={node}
-                onRefresh={refresh}
-              />
-              <StackConfigs node={node} onRefresh={refresh} />
-              {library.length > 0 && (
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-slate-500 font-medium uppercase tracking-wider">Model Library</span>
-                    <button
-                      onClick={() => setShowLibMgr(true)}
-                      className="text-xs px-2.5 py-1 rounded-lg border border-border text-slate-400 hover:text-white hover:border-slate-500 transition-colors"
-                    >
-                      Manage library
-                    </button>
-                  </div>
-                  <ModelLibrary
-                    models={library}
-                    gpus={status.gpus}
-                    instances={status.instances}
-                    node={node}
-                    onRefresh={refresh}
-                  />
-                </div>
-              )}
-              {showLibMgr && (
-                <ModelLibraryManager
-                  node={node}
-                  onClose={() => setShowLibMgr(false)}
-                  onChanged={() => { onLibraryChanged?.(); refresh(); }}
-                />
-              )}
-            </>
+        <div className="px-4 pb-4 pt-3 bg-surface border-t border-border">
+          {online ? (
+            <StackConfigs node={node} onRefresh={onRefresh} />
           ) : (
-            <p className="text-sm text-slate-500 text-center py-4">Connecting…</p>
+            <p className="text-xs text-slate-500 py-2">Agent must be online to manage stack templates.</p>
           )}
         </div>
       )}

@@ -10,6 +10,7 @@ export interface GPU {
   vram_used_mb: number;
   vram_free_mb: number;
   vram_total_mb: number;
+  unified_memory?: boolean;
   utilization_pct: number;
   temperature_c: number | null;
   fan_speed_pct: number | null;
@@ -65,6 +66,17 @@ export interface NodeConfig {
   ip: string;
   agent_port: number;
   setup_cmd?: string;
+}
+
+export interface ClusterNodeStatus {
+  node: NodeConfig;
+  status: FullStatus | null;
+  error: string | null;
+}
+
+export interface ClusterGPU {
+  node: NodeConfig;
+  gpu: GPU;
 }
 
 export interface RepackAssignment {
