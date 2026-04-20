@@ -82,6 +82,7 @@ cfg = {
     "this_ip": os.environ["CFG_THIS_IP"],
     "master": {
         "ip":             os.environ["CFG_MASTER_IP"],
+        "agent_port":     int(os.environ.get("CFG_MASTER_AGENT_PORT", "5000")),
         "dashboard_port": int(os.environ["CFG_DASH_PORT"])
     },
     "agent_port": int(os.environ["CFG_AGENT_PORT"]),
@@ -344,6 +345,7 @@ PY
     CFG_ROLE="$role" \
     CFG_THIS_IP="$this_ip" \
     CFG_MASTER_IP="$master_ip" \
+    CFG_MASTER_AGENT_PORT="${VLLM_MASTER_AGENT_PORT:-5000}" \
     CFG_DASH_PORT="$dashboard_port" \
     CFG_AGENT_PORT="$agent_port" \
     CFG_NODES="$nodes_json" \
@@ -516,19 +518,15 @@ do_start() {
             || warn "Agent start reported errors — check agent/agent.log"
     fi
 
-    if [ "$role" = "master" ] || [ "$role" = "both" ]; then
-        info "Starting dashboard (port $dashboard_port)..."
-        AGENT_URL="http://localhost:$agent_port" \
-        DASHBOARD_PORT="$dashboard_port" \
-        bash "$SCRIPT_DIR/dashboard/start_dashboard.sh" \
-            || warn "Dashboard start reported errors — check dashboard/dashboard.log"
-    fi
+    info "Starting dashboard (port $dashboard_port)..."
+    AGENT_URL="http://localhost:$agent_port" \
+    DASHBOARD_PORT="$dashboard_port" \
+    bash "$SCRIPT_DIR/dashboard/start_dashboard.sh" \
+        || warn "Dashboard start reported errors — check dashboard/dashboard.log"
 
     echo ""
     success "Start sequence complete."
-    if [ "$role" != "child" ]; then
-        echo -e "  Dashboard  →  ${CYAN}http://$this_ip:$dashboard_port${RESET}"
-    fi
+    echo -e "  Dashboard  →  ${CYAN}http://$this_ip:$dashboard_port${RESET}"
     if [ "$role" != "master" ]; then
         echo -e "  Agent      →  ${CYAN}http://$this_ip:$agent_port${RESET}"
         echo -e "  LiteLLM    →  ${CYAN}http://$this_ip:4000${RESET}"

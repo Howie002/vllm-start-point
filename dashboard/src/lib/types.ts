@@ -64,6 +64,7 @@ export interface NodeConfig {
   name: string;
   ip: string;
   agent_port: number;
+  setup_cmd?: string;
 }
 
 export interface RepackAssignment {

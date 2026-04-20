@@ -1041,6 +1041,71 @@ def agent_stop():
     return {"stopping": True}
 
 
+NODE_CONFIG_PATH = Path(__file__).parent.parent / "node_config.json"
+
+@app.get("/nodes")
+def get_nodes():
+    """Return the full node list — used by child dashboards to show the whole cluster."""
+    try:
+        config = json.loads(NODE_CONFIG_PATH.read_text())
+        return config.get("nodes", [])
+    except Exception:
+        return []
+
+
+DASHBOARD_DIR = Path(__file__).parent.parent / "dashboard"
+DASHBOARD_PID_FILE = DASHBOARD_DIR / ".dashboard_pid"
+
+
+def _dashboard_pid() -> int | None:
+    try:
+        pid = int(DASHBOARD_PID_FILE.read_text().strip())
+        os.kill(pid, 0)  # check alive
+        return pid
+    except Exception:
+        return None
+
+
+@app.post("/dashboard/restart")
+def dashboard_restart():
+    """Kill the dashboard, rebuild, and restart it."""
+    def _do():
+        time.sleep(0.3)
+        # Kill existing process
+        pid = _dashboard_pid()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(1)
+            except ProcessLookupError:
+                pass
+        # Rebuild and restart
+        env = {**os.environ, "PATH": f"/usr/local/bin:/usr/bin:/bin:{os.environ.get('PATH', '')}"}
+        subprocess.run(["npm", "run", "build"], cwd=str(DASHBOARD_DIR), env=env)
+        port = os.environ.get("DASHBOARD_PORT", "3000")
+        proc = subprocess.Popen(
+            ["npm", "run", "start", "--", "-p", port],
+            cwd=str(DASHBOARD_DIR),
+            env=env,
+            stdout=open(DASHBOARD_DIR / "dashboard.log", "w"),
+            stderr=subprocess.STDOUT,
+        )
+        DASHBOARD_PID_FILE.write_text(str(proc.pid))
+    threading.Thread(target=_do, daemon=True).start()
+    return {"restarting": True}
+
+
+@app.post("/dashboard/stop")
+def dashboard_stop():
+    """Stop the dashboard process."""
+    pid = _dashboard_pid()
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        DASHBOARD_PID_FILE.unlink(missing_ok=True)
+        return {"stopped": True, "pid": pid}
+    return {"stopped": False, "detail": "Dashboard not running"}
+
+
 @app.get("/status")
 def get_full_status():
     """All data in a single call — used for dashboard polling."""

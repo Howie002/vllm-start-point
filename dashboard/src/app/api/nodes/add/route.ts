@@ -8,6 +8,7 @@ interface NodeEntry {
   name: string;
   ip: string;
   agent_port: number;
+  setup_cmd?: string;
 }
 
 interface AddNodeBody {
@@ -35,32 +36,38 @@ export async function POST(req: Request) {
       config = { role: "master", nodes: [] };
     }
 
-    const nodes: NodeEntry[] = (config.nodes as NodeEntry[]) ?? [];
-
-    // Replace if same IP+port already registered, otherwise append
-    const idx = nodes.findIndex((n) => n.ip === ip && n.agent_port === agent_port);
-    if (idx >= 0) {
-      nodes[idx] = { name, ip, agent_port };
-    } else {
-      nodes.push({ name, ip, agent_port });
-    }
-
-    config.nodes = nodes;
-    writeFileSync(configPath, JSON.stringify(config, null, 2));
-
-    // Build the setup one-liner for the child machine
     const masterIp = (config.master as { ip?: string } | undefined)?.ip
       ?? (config.this_ip as string | undefined)
       ?? "MASTER_IP";
+
+    // Store master agent_port so child dashboards can fetch the node list from master
+    const masterAgentPort = (config.agent_port as number | undefined) ?? 5000;
+    if (config.master && typeof config.master === "object") {
+      (config.master as Record<string, unknown>).agent_port = masterAgentPort;
+    }
 
     const setupCmd = [
       `VLLM_NONINTERACTIVE=1`,
       `VLLM_ROLE=child`,
       `VLLM_THIS_IP=${ip}`,
       `VLLM_MASTER_IP=${masterIp}`,
+      `VLLM_MASTER_AGENT_PORT=${masterAgentPort}`,
       `VLLM_AGENT_PORT=${agent_port}`,
       `bash ./node.sh setup`,
     ].join(" ");
+
+    const nodes: NodeEntry[] = (config.nodes as NodeEntry[]) ?? [];
+
+    // Replace if same IP+port already registered, otherwise append
+    const idx = nodes.findIndex((n) => n.ip === ip && n.agent_port === agent_port);
+    if (idx >= 0) {
+      nodes[idx] = { name, ip, agent_port, setup_cmd: setupCmd };
+    } else {
+      nodes.push({ name, ip, agent_port, setup_cmd: setupCmd });
+    }
+
+    config.nodes = nodes;
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
 
     return NextResponse.json({ added: { name, ip, agent_port }, setup_cmd: setupCmd });
   } catch (e) {

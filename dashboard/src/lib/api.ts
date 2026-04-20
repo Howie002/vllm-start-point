@@ -1,4 +1,4 @@
-import type { FullStatus, ModelEntry, LaunchRequest, NodeConfig, StackConfig, PreflightResult, RepackResult, RepackAssignment } from "./types";
+import type { FullStatus, ModelEntry, LaunchRequest, NodeConfig, StackConfig, StackModelConfig, PreflightResult, RepackResult, RepackAssignment } from "./types";
 
 // Build a direct URL to a node's agent (browser calls this cross-origin)
 function agentBase(node: NodeConfig): string {
@@ -49,8 +49,11 @@ export function createNodeApi(node: NodeConfig) {
     deactivateConfig: (name: string)                       => post<object>(base, `/configs/${encodeURIComponent(name)}/deactivate`, {}),
     deleteConfig:     (name: string)                       => del<{ deleted: string }>           (base, `/configs/${encodeURIComponent(name)}`),
     snapshotConfig:   (name: string, description: string)  => post<{ saved: string }>            (base, "/configs/snapshot", { name, description }),
+    saveConfig:       (cfg: StackConfig)                    => post<{ saved: string }>            (base, "/configs", cfg),
     restartAgent:         ()                                        => post<{ restarting: boolean }>(base, "/agent/restart", {}),
     stopAgent:            ()                                        => post<{ stopping: boolean }> (base, "/agent/stop", {}),
+    restartDashboard:     ()                                        => post<{ restarting: boolean }>(base, "/dashboard/restart", {}),
+    stopDashboard:        ()                                        => post<{ stopped: boolean }>  (base, "/dashboard/stop", {}),
     libraryAll:           ()                                        => get<ModelEntry[]>           (base, "/models/library/all"),
     toggleModel:          (id: string, enabled: boolean)           => fetch(`${base}/models/library/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }).then(r => r.json()) as Promise<ModelEntry>,
     addModel:             (entry: Partial<ModelEntry>)             => post<ModelEntry>             (base, "/models/library", entry),

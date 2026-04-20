@@ -23,6 +23,7 @@ export function NodeCard({ node, library, defaultOpen = true, onLibraryChanged }
   const [error, setError]                 = useState<string | null>(null);
   const [open, setOpen]                   = useState(defaultOpen);
   const [agentBusy, setAgentBusy]         = useState<"restarting" | "stopping" | null>(null);
+  const [dashBusy, setDashBusy]           = useState<"restarting" | "stopping" | null>(null);
   const [showLibMgr, setShowLibMgr]       = useState(false);
 
   const refresh = useCallback(async () => {
@@ -73,6 +74,19 @@ export function NodeCard({ node, library, defaultOpen = true, onLibraryChanged }
     }
   }
 
+  async function handleDashboardRestart() {
+    if (!confirm("Rebuild and restart the dashboard? This takes ~1 minute. The page will go offline briefly.")) return;
+    setDashBusy("restarting");
+    try {
+      await createNodeApi(node).restartDashboard();
+    } catch {
+      // ignore — page will reload itself
+    }
+    // Wait for build then reload
+    await new Promise((r) => setTimeout(r, 60000));
+    window.location.reload();
+  }
+
   const online = !!status && !error;
   const totalVram = status?.gpus.reduce((a, g) => a + g.vram_total_mb, 0) ?? 0;
   const usedVram  = status?.gpus.reduce((a, g) => a + g.vram_used_mb,  0) ?? 0;
@@ -112,12 +126,21 @@ export function NodeCard({ node, library, defaultOpen = true, onLibraryChanged }
           <span className="ml-auto text-xs text-red-400">unreachable</span>
         )}
 
-        {/* Agent controls — stop propagation so they don't toggle expand */}
+        {/* Agent + dashboard controls */}
         {online && (
           <div className="flex items-center gap-1 ml-auto" onClick={(e) => e.stopPropagation()}>
             <button
+              onClick={handleDashboardRestart}
+              disabled={!!dashBusy || !!agentBusy}
+              className="text-xs px-2 py-0.5 rounded text-slate-500 hover:text-emerald-400 hover:bg-slate-700/50 disabled:opacity-40 transition-colors"
+              title="Rebuild and restart dashboard (~1 min)"
+            >
+              {dashBusy === "restarting" ? "Building…" : "Restart dashboard"}
+            </button>
+            <span className="text-slate-700 text-xs">|</span>
+            <button
               onClick={handleRestart}
-              disabled={!!agentBusy}
+              disabled={!!agentBusy || !!dashBusy}
               className="text-xs px-2 py-0.5 rounded text-slate-500 hover:text-blue-400 hover:bg-slate-700/50 disabled:opacity-40 transition-colors"
               title="Restart agent"
             >
@@ -125,7 +148,7 @@ export function NodeCard({ node, library, defaultOpen = true, onLibraryChanged }
             </button>
             <button
               onClick={handleStop}
-              disabled={!!agentBusy}
+              disabled={!!agentBusy || !!dashBusy}
               className="text-xs px-2 py-0.5 rounded text-slate-500 hover:text-red-400 hover:bg-slate-700/50 disabled:opacity-40 transition-colors"
               title="Stop agent"
             >
@@ -141,10 +164,28 @@ export function NodeCard({ node, library, defaultOpen = true, onLibraryChanged }
       {open && (
         <div className="p-5 space-y-6 bg-surface border-t border-border">
           {error ? (
-            <p className="text-sm text-red-400 bg-red-900/20 border border-red-800 rounded-xl px-4 py-3">
-              Cannot reach agent at <code className="font-mono">{node.ip}:{node.agent_port}</code>
-              . Ensure <code className="font-mono">./node.sh start</code> has been run on that machine.
-            </p>
+            <div className="bg-red-900/20 border border-red-800 rounded-xl px-4 py-3 space-y-2">
+              <p className="text-sm text-red-400">
+                Cannot reach agent at <code className="font-mono">{node.ip}:{node.agent_port}</code>.
+              </p>
+              {node.setup_cmd ? (
+                <>
+                  <p className="text-xs text-slate-400">
+                    Run this on <span className="text-white font-medium">{node.name}</span> to bring it online:
+                  </p>
+                  <pre className="text-xs bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-emerald-300 font-mono whitespace-pre-wrap break-all select-all">
+                    {node.setup_cmd}
+                  </pre>
+                  <p className="text-xs text-slate-500">
+                    Once the agent is running, this card will connect automatically within 8 seconds.
+                  </p>
+                </>
+              ) : (
+                <p className="text-xs text-slate-500">
+                  Ensure <code className="font-mono">./node.sh start</code> has been run on that machine.
+                </p>
+              )}
+            </div>
           ) : status ? (
             <>
               <GPUGrid gpus={status.gpus} instances={status.instances} />

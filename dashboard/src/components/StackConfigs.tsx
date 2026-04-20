@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import type { StackConfig, PreflightResult, PreflightCheck, RepackResult, RepackAssignment, NodeConfig } from "@/lib/types";
+import type { StackConfig, StackModelConfig, ModelEntry, PreflightResult, PreflightCheck, RepackResult, RepackAssignment, NodeConfig } from "@/lib/types";
 import { createNodeApi } from "@/lib/api";
 
 interface Props {
@@ -338,15 +338,253 @@ function PreflightPanel({
   );
 }
 
+// ── Create stack panel ────────────────────────────────────────────────────────
+
+const TYPE_COLORS: Record<string, string> = {
+  chat:      "bg-blue-900/40 text-blue-300",
+  reasoning: "bg-purple-900/40 text-purple-300",
+  embedding: "bg-teal-900/40 text-teal-300",
+};
+
+function slugify(name: string) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+
+interface CreateStackPanelProps {
+  library: ModelEntry[];
+  saving: boolean;
+  onSave: (cfg: StackConfig) => void;
+  onCancel: () => void;
+}
+
+function CreateStackPanel({ library, saving, onSave, onCancel }: CreateStackPanelProps) {
+  const [name, setName]               = useState("");
+  const [description, setDescription] = useState("");
+  const [models, setModels]           = useState<StackModelConfig[]>([]);
+
+  // Row being assembled
+  const [selId, setSelId]       = useState(library[0]?.id ?? "");
+  const [servedName, setServedName] = useState("");
+  const [port, setPort]         = useState(8000);
+  const [gpuStr, setGpuStr]     = useState("0");
+  const [utilPct, setUtilPct]   = useState(85);
+
+  const selectedModel = library.find((m) => m.id === selId);
+
+  // Auto-fill served name when model changes
+  useEffect(() => {
+    if (selectedModel) setServedName(slugify(selectedModel.name));
+  }, [selId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-increment port suggestion when a model is added
+  function nextPort(existing: StackModelConfig[]) {
+    if (existing.length === 0) return 8000;
+    return Math.max(...existing.map((m) => m.port)) + 1;
+  }
+
+  function addModel() {
+    const gpuIndices = gpuStr.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
+    if (!selId || gpuIndices.length === 0) return;
+    const newModel: StackModelConfig = {
+      model_id: selId,
+      served_name: servedName || slugify(selectedModel?.name ?? selId),
+      gpu_indices: gpuIndices,
+      port,
+      gpu_memory_utilization: utilPct / 100,
+      extra_flags: selectedModel?.flags ?? {},
+    };
+    const updated = [...models, newModel];
+    setModels(updated);
+    setPort(nextPort(updated));
+    setGpuStr("0");
+    setUtilPct(85);
+    // Pick next unselected model if possible
+    const usedIds = new Set(updated.map((m) => m.model_id));
+    const next = library.find((m) => !usedIds.has(m.id));
+    if (next) setSelId(next.id);
+  }
+
+  function removeModel(idx: number) {
+    setModels((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!name.trim() || models.length === 0) return;
+    onSave({ name: name.trim(), description: description.trim(), models });
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="border border-blue-500/30 bg-slate-900/70 rounded-xl px-4 py-4 space-y-4">
+      <p className="text-sm font-semibold text-white">Create stack config</p>
+
+      {/* Name + description */}
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="text-xs text-slate-500 mb-1 block">Stack name *</label>
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+            placeholder="e.g. Production, Dev, Embedding Only"
+            className="w-full bg-slate-800 border border-border rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500 placeholder-slate-600"
+          />
+        </div>
+        <div>
+          <label className="text-xs text-slate-500 mb-1 block">Description</label>
+          <input
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Optional"
+            className="w-full bg-slate-800 border border-border rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500 placeholder-slate-600"
+          />
+        </div>
+      </div>
+
+      {/* Model picker */}
+      <div className="bg-slate-800/60 rounded-lg px-3 py-3 space-y-3">
+        <p className="text-xs text-slate-400 font-medium">Add model</p>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+          <div className="col-span-2 sm:col-span-1">
+            <label className="text-xs text-slate-500 mb-1 block">Model</label>
+            <select
+              value={selId}
+              onChange={(e) => setSelId(e.target.value)}
+              className="w-full bg-slate-700 border border-border rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+            >
+              {library.map((m) => (
+                <option key={m.id} value={m.id}>{m.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 mb-1 block">Served as</label>
+            <input
+              value={servedName}
+              onChange={(e) => setServedName(e.target.value)}
+              placeholder="slug"
+              className="w-full bg-slate-700 border border-border rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500 placeholder-slate-600"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 mb-1 block">Port</label>
+            <input
+              type="number"
+              value={port}
+              onChange={(e) => setPort(Number(e.target.value))}
+              className="w-full bg-slate-700 border border-border rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 mb-1 block">GPU(s)</label>
+            <input
+              value={gpuStr}
+              onChange={(e) => setGpuStr(e.target.value)}
+              placeholder="0 or 0,1"
+              className="w-full bg-slate-700 border border-border rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500 placeholder-slate-600 font-mono"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 mb-1 block">VRAM util%</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min={20} max={98} step={1}
+                value={utilPct}
+                onChange={(e) => setUtilPct(Number(e.target.value))}
+                className="flex-1 accent-blue-500"
+              />
+              <span className="text-xs text-slate-300 w-8 text-right">{utilPct}%</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Model info chip */}
+        {selectedModel && (
+          <div className="flex items-center gap-2 text-xs text-slate-400">
+            <span className={`px-1.5 py-0.5 rounded-full ${TYPE_COLORS[selectedModel.type] ?? "bg-slate-700 text-slate-300"}`}>
+              {selectedModel.type}
+            </span>
+            <span>{selectedModel.vram_gb} GB VRAM</span>
+            <span>·</span>
+            <span>{(selectedModel.max_context / 1024).toFixed(0)}K ctx</span>
+            <span>·</span>
+            <span className="font-mono text-slate-500 truncate">{selectedModel.id}</span>
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={addModel}
+          disabled={!selId}
+          className="text-xs px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-40 transition-colors"
+        >
+          + Add to stack
+        </button>
+      </div>
+
+      {/* Models added */}
+      {models.length > 0 && (
+        <div className="space-y-1.5">
+          <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Stack ({models.length} model{models.length !== 1 ? "s" : ""})</p>
+          {models.map((m, i) => {
+            const lib = library.find((l) => l.id === m.model_id);
+            return (
+              <div key={i} className="bg-slate-800/60 rounded-lg px-3 py-2 flex items-center gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-sm text-white font-medium">{lib?.name ?? m.model_id}</span>
+                    {lib && (
+                      <span className={`text-xs px-1.5 py-0.5 rounded-full ${TYPE_COLORS[lib.type] ?? "bg-slate-700 text-slate-300"}`}>
+                        {lib.type}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex gap-3 text-xs text-slate-500 mt-0.5 flex-wrap">
+                    <span>:{m.port}</span>
+                    <span>GPU {m.gpu_indices.join("+")}</span>
+                    <span>{Math.round(m.gpu_memory_utilization * 100)}% util</span>
+                    <span className="font-mono text-slate-600">{m.served_name}</span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removeModel(i)}
+                  className="text-slate-700 hover:text-red-400 transition-colors text-sm px-1"
+                >✕</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="flex gap-2 justify-end">
+        <button type="button" onClick={onCancel} className="px-3 py-1.5 text-sm text-slate-400 hover:text-white transition-colors">
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={saving || !name.trim() || models.length === 0}
+          className="px-4 py-1.5 text-sm rounded-lg bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50 transition-colors"
+        >
+          {saving ? "Saving…" : "Save stack"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function StackConfigs({ node, onRefresh }: Props) {
   const [configs, setConfigs]           = useState<StackConfig[]>([]);
+  const [library, setLibrary]           = useState<ModelEntry[]>([]);
   const [loading, setLoading]           = useState(true);
   const [busy, setBusy]                 = useState<string | null>(null);
   const [error, setError]               = useState<string | null>(null);
   const [snapshotName, setSnapshotName] = useState("");
   const [showSnapshot, setShowSnapshot] = useState(false);
+  const [showCreate, setShowCreate]     = useState(false);
+  const [creating, setCreating]         = useState(false);
 
   // Preflight state
   const [preflightFor, setPreflightFor]       = useState<string | null>(null);
@@ -364,8 +602,9 @@ export function StackConfigs({ node, onRefresh }: Props) {
 
   const refresh = useCallback(async () => {
     try {
-      const data = await api.configs();
-      setConfigs(data);
+      const [cfgData, libData] = await Promise.all([api.configs(), api.library()]);
+      setConfigs(cfgData);
+      setLibrary(libData);
     } catch {
       // silently ignore
     } finally {
@@ -373,7 +612,11 @@ export function StackConfigs({ node, onRefresh }: Props) {
     }
   }, [node]);  // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 10000);
+    return () => clearInterval(id);
+  }, [refresh]);
 
   async function handleActivateClick(name: string) {
     setError(null);
@@ -496,6 +739,20 @@ export function StackConfigs({ node, onRefresh }: Props) {
     }
   }
 
+  async function handleCreateSave(cfg: StackConfig) {
+    setCreating(true);
+    setError(null);
+    try {
+      await api.saveConfig(cfg);
+      setShowCreate(false);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
   async function handleSnapshot(e: React.FormEvent) {
     e.preventDefault();
     const name = snapshotName.trim() || "Snapshot";
@@ -517,13 +774,32 @@ export function StackConfigs({ node, onRefresh }: Props) {
     <div className="bg-card border border-border rounded-xl overflow-hidden">
       <div className="px-4 py-3 border-b border-border flex items-center justify-between">
         <h2 className="text-sm font-semibold text-white">Stack Templates</h2>
-        <button
-          onClick={() => setShowSnapshot((v) => !v)}
-          className="text-xs px-3 py-1 rounded border border-border text-slate-400 hover:text-white hover:border-slate-500 transition-colors"
-        >
-          + Snapshot current
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => { setShowCreate((v) => !v); setShowSnapshot(false); setError(null); }}
+            className="text-xs px-3 py-1 rounded border border-border text-slate-400 hover:text-white hover:border-slate-500 transition-colors"
+          >
+            + Create stack
+          </button>
+          <button
+            onClick={() => { setShowSnapshot((v) => !v); setShowCreate(false); }}
+            className="text-xs px-3 py-1 rounded border border-border text-slate-400 hover:text-white hover:border-slate-500 transition-colors"
+          >
+            + Snapshot current
+          </button>
+        </div>
       </div>
+
+      {showCreate && library.length > 0 && (
+        <div className="px-4 py-4 border-b border-border">
+          <CreateStackPanel
+            library={library}
+            saving={creating}
+            onSave={handleCreateSave}
+            onCancel={() => { setShowCreate(false); setError(null); }}
+          />
+        </div>
+      )}
 
       {showSnapshot && (
         <form onSubmit={handleSnapshot} className="px-4 py-3 border-b border-border bg-slate-900/50 flex gap-2">
