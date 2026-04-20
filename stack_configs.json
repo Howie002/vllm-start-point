@@ -1,0 +1,70 @@
+[
+  {
+    "name": "Default Stack",
+    "description": "Production setup — Nano + embedding on GPU 1, two Super instances on GPUs 2 and 3.",
+    "models": [
+      {
+        "model_id": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+        "served_name": "nemotron-nano",
+        "gpu_indices": [1],
+        "port": 8001,
+        "gpu_memory_utilization": 0.60,
+        "extra_flags": {
+          "quantization": "fp8",
+          "max_model_len": 32768
+        }
+      },
+      {
+        "model_id": "Alibaba-NLP/gte-Qwen2-7B-instruct",
+        "served_name": "text-embedding",
+        "gpu_indices": [1],
+        "port": 8011,
+        "gpu_memory_utilization": 0.20,
+        "extra_flags": {
+          "runner": "pooling",
+          "trust_remote_code": true,
+          "hf_overrides": {"is_causal": false}
+        }
+      },
+      {
+        "model_id": "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+        "served_name": "nemotron-super",
+        "gpu_indices": [2],
+        "port": 8003,
+        "gpu_memory_utilization": 0.85,
+        "extra_flags": {
+          "trust_remote_code": true,
+          "max_model_len": 32768
+        }
+      },
+      {
+        "model_id": "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+        "served_name": "nemotron-super",
+        "gpu_indices": [3],
+        "port": 8004,
+        "gpu_memory_utilization": 0.85,
+        "extra_flags": {
+          "trust_remote_code": true,
+          "max_model_len": 32768
+        }
+      }
+    ]
+  },
+  {
+    "name": "Nano Only",
+    "description": "Single lightweight instance on GPU 0 — minimal footprint for testing or low-load use.",
+    "models": [
+      {
+        "model_id": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+        "served_name": "nemotron-nano",
+        "gpu_indices": [0],
+        "port": 8020,
+        "gpu_memory_utilization": 0.40,
+        "extra_flags": {
+          "quantization": "fp8",
+          "max_model_len": 32768
+        }
+      }
+    ]
+  }
+]

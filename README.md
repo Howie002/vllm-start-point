@@ -1,0 +1,175 @@
+# vLLM Stack
+
+Self-hosted AI inference across one or more GPU machines. All models are served through an OpenAI-compatible API — drop-in replacement for cloud endpoints with no per-token cost and no data leaving the network.
+
+---
+
+## Quick Start
+
+### First machine (or only machine)
+
+```bash
+git clone <repo>
+cd <repo>
+./node.sh
+```
+
+The script will ask three questions (role, IP, ports), install all dependencies, and start everything.
+
+### Adding a second GPU machine
+
+On the **new machine**:
+```bash
+./node.sh          # choose role: child
+                   # enter master IP when prompted
+```
+
+On the **master**:
+```bash
+./node.sh add-node   # enter the new machine's IP
+```
+
+---
+
+## Node Roles
+
+| Role | What runs | Use when |
+|---|---|---|
+| `master` | Dashboard only | Dedicated VM / management box |
+| `child` | vLLM inference + control agent | GPU server |
+| `both` | Everything | Single machine with GPU |
+
+---
+
+## node.sh Commands
+
+```
+./node.sh              # Interactive menu (first run = full setup)
+./node.sh setup        # Configure role, IPs, install all dependencies
+./node.sh start        # Start services for this node's role
+./node.sh stop         # Stop all local services
+./node.sh add-node     # Register a new child node with this master
+./node.sh status       # Check what's running + ping all registered nodes
+```
+
+---
+
+## Architecture
+
+```
+                         CLIENTS
+                            │
+                            ▼
+               ┌────────────────────────┐
+               │   Dashboard  :3000     │  ← master node (VM or any machine)
+               └────────────────────────┘
+                            │  queries each child agent directly
+                            ▼
+            ┌───────────────────────────────┐
+            │  Control Agent  :5000         │  ← each GPU machine
+            │  FastAPI — GPU stats,         │
+            │  instance mgmt, proxy mgmt    │
+            └───────────────────────────────┘
+                            │
+               ┌────────────┴────────────┐
+               ▼                         ▼
+   ┌───────────────────┐     ┌───────────────────┐
+   │  LiteLLM  :4000   │     │  vLLM instances   │
+   │  Proxy + routing  │────▶│  :8001 :8003 :8004 │
+   └───────────────────┘     └───────────────────┘
+```
+
+### Default GPU layout (4× RTX PRO 6000, 96 GB each)
+
+| GPU | VRAM | Static workload |
+|---|---|---|
+| 0 | 96 GB | Dynamic — LM Studio, overflow, ad-hoc |
+| 1 | 96 GB | Nemotron Nano FP8 (port 8001) + GTE-Qwen2-7B embed (port 8011) |
+| 2 | 96 GB | Nemotron Super 49B FP8 instance A (port 8003) |
+| 3 | 96 GB | Nemotron Super 49B FP8 instance B (port 8004) |
+
+LiteLLM load-balances across both Super instances automatically.
+
+---
+
+## API Access
+
+All requests go through the LiteLLM proxy:
+
+```
+Base URL:   http://<gpu-machine>:4000/v1
+Auth:       Authorization: Bearer none
+```
+
+```bash
+# Chat (fast)
+curl http://<gpu-machine>:4000/v1/chat/completions \
+  -H "Authorization: Bearer none" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "nemotron-nano", "messages": [{"role": "user", "content": "Hello"}]}'
+
+# Chat (high quality, load balanced)
+curl http://<gpu-machine>:4000/v1/chat/completions \
+  -H "Authorization: Bearer none" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "nemotron-super", "messages": [{"role": "user", "content": "Explain transformers"}]}'
+
+# Embeddings
+curl http://<gpu-machine>:4000/v1/embeddings \
+  -H "Authorization: Bearer none" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "text-embedding", "input": "sample text"}'
+```
+
+---
+
+## Dependencies
+
+**One-time system prerequisites** (only needed if not already installed):
+```bash
+sudo apt-get install -y curl cuda-toolkit-12-8
+```
+
+`node.sh setup` will attempt to install these automatically. If `apt-get` is unavailable, see [Four Card AI Setup.md](Four%20Card%20AI%20Setup.md) for manual steps.
+
+**Python venv** is created at `~/.vllm-venv` (outside the repo) to avoid spaces-in-path issues with nvcc. It is not committed.
+
+**Node.js 20+** is required on master nodes. `node.sh setup` installs it automatically via NodeSource if missing.
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `node.sh` | Unified node manager — configure, install, start, stop, add nodes |
+| `setup.sh` | Idempotent Python venv + vLLM installer (called by node.sh) |
+| `start_inference_stack.sh` | Launches all vLLM instances + LiteLLM proxy |
+| `stop_inference_stack.sh` | Gracefully shuts down the inference stack |
+| `litellm_config.yaml` | LiteLLM proxy routing config |
+| `agent/agent.py` | FastAPI control agent — GPU stats, instance management, model library |
+| `agent/start_agent.sh` / `stop_agent.sh` | Agent lifecycle scripts |
+| `dashboard/` | Next.js dashboard (multi-node, dark theme) |
+| `dashboard/start_dashboard.sh` / `stop_dashboard.sh` | Dashboard lifecycle scripts |
+| `node_config.json` | Generated by `node.sh setup` — machine-specific, gitignored |
+| `logs/` | Per-service log files, created at runtime, gitignored |
+| `Four Card AI Setup.md` | Detailed hardware/software reference and implementation notes |
+
+---
+
+## Dashboard
+
+The dashboard runs on the master node and shows all registered child nodes. Each node displays:
+
+- Per-GPU VRAM usage and utilization
+- Running vLLM instances with health status
+- LiteLLM proxy status and registered models
+- Model library with one-click Deploy (GPU picker, port, proxy registration)
+
+Access at `http://<master-ip>:3000`
+
+---
+
+## Windows
+
+`start.bat` and `stop.bat` launch the stack via WSL with an nvidia-smi monitor window. They are an alternative to `node.sh` for machines where WSL is the primary interface.

@@ -1,0 +1,41 @@
+model_list:
+  - model_name: nemotron-nano
+    litellm_params:
+      model: openai/nemotron-nano
+      api_base: http://localhost:8001/v1
+      api_key: "none"
+
+  - model_name: nemotron-super
+    litellm_params:
+      model: openai/nemotron-super
+      api_base: http://localhost:8003/v1
+      api_key: "none"
+      # nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8 on GPU 2 (instance A)
+
+  - model_name: nemotron-super
+    litellm_params:
+      model: openai/nemotron-super
+      api_base: http://localhost:8004/v1
+      api_key: "none"
+      # nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8 on GPU 3 (instance B)
+
+  - model_name: text-embedding
+    litellm_params:
+      model: openai/text-embedding
+      api_base: http://localhost:8011/v1
+      api_key: "none"
+      # Alibaba-NLP/gte-Qwen2-7B-instruct on GPU 1 — MTEB 70.24
+
+router_settings:
+  routing_strategy: least-busy
+  num_retries: 3
+  timeout: 30
+  retry_after: 5
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+
+general_settings:
+  master_key: "none"
+  port: 4000

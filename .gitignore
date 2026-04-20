@@ -1,0 +1,30 @@
+# Runtime files — never commit these
+logs/
+.stack_pids
+.setup_done
+node_config.json
+
+# Python — venv lives at ~/.vllm-venv (outside repo), never committed
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# HuggingFace model cache (large binaries)
+.cache/
+
+# Dashboard build artifacts
+dashboard/.next/
+dashboard/node_modules/
+dashboard/.dashboard_pid
+dashboard/dashboard.log
+
+# Agent runtime
+agent/.agent_pid
+agent/agent.log
+
+# OS
+.DS_Store
+Thumbs.db

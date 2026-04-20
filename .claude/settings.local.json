@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash start_inference_stack.sh)",
+      "Bash(bash stop_inference_stack.sh)",
+      "Bash(bash setup.sh)"
+    ]
+  }
+}

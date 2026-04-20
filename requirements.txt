@@ -1,0 +1,14 @@
+# vLLM Inference Stack — Python dependencies
+#
+# Install via:  pip install -r requirements.txt
+# Or let setup.sh handle it automatically.
+#
+# vLLM — bundles its own CUDA 12.x libraries; no separate CUDA toolkit needed.
+# Blackwell (RTX PRO 6000) requires vllm >= 0.8.0
+vllm>=0.8.0
+
+# LiteLLM proxy — [proxy] extra pulls in apscheduler, uvicorn, fastapi, etc.
+litellm[proxy]>=1.83.0
+
+# HuggingFace tooling — model downloads, auth
+huggingface_hub[cli]>=0.23.0
