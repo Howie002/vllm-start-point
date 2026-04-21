@@ -318,32 +318,20 @@ do_setup() {
             i=$((i + 1))
         done
 
-        # Build JSON array in Python — no quoting issues
-        nodes_json=$(python3 - "${#names[@]}" <<'PY' 2>/dev/null
-import json, sys, os
-count = int(sys.argv[1])
-names  = os.environ["NODE_NAMES"].split("\x00")  if os.environ.get("NODE_NAMES")  else []
-ips    = os.environ["NODE_IPS"].split("\x00")    if os.environ.get("NODE_IPS")    else []
-ports  = os.environ["NODE_PORTS"].split("\x00")  if os.environ.get("NODE_PORTS")  else []
-nodes  = [{"name": names[i], "ip": ips[i], "agent_port": int(ports[i])} for i in range(count)]
-print(json.dumps(nodes))
-PY
-) || nodes_json="[]"
-        # Re-run with proper env if we have nodes
+        # Build JSON array in Python — join with | (safe: IPs/ports/names won't contain it)
         if [ "${#names[@]}" -gt 0 ]; then
             local joined_names joined_ips joined_ports
-            # Join with null byte separator (safe for any string content)
-            joined_names=$(printf '%s\0' "${names[@]}")
-            joined_ips=$(printf '%s\0' "${ips[@]}")
-            joined_ports=$(printf '%s\0' "${ports[@]}")
+            joined_names=$(IFS='|'; echo "${names[*]}")
+            joined_ips=$(IFS='|'; echo "${ips[*]}")
+            joined_ports=$(IFS='|'; echo "${ports[*]}")
             nodes_json=$(NODE_NAMES="$joined_names" NODE_IPS="$joined_ips" NODE_PORTS="$joined_ports" \
                 python3 - "${#names[@]}" <<'PY'
 import json, sys, os
-count  = int(sys.argv[1])
-names  = os.environ["NODE_NAMES"].split("\x00")[:count]
-ips    = os.environ["NODE_IPS"].split("\x00")[:count]
-ports  = os.environ["NODE_PORTS"].split("\x00")[:count]
-nodes  = [{"name": names[i], "ip": ips[i], "agent_port": int(ports[i])} for i in range(count)]
+count = int(sys.argv[1])
+names = os.environ["NODE_NAMES"].split("|")[:count]
+ips   = os.environ["NODE_IPS"].split("|")[:count]
+ports = os.environ["NODE_PORTS"].split("|")[:count]
+nodes = [{"name": names[i], "ip": ips[i], "agent_port": int(ports[i])} for i in range(count)]
 print(json.dumps(nodes))
 PY
 ) || nodes_json="[]"

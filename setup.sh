@@ -5,6 +5,12 @@
 #  Safe to run repeatedly — skips work that is already done.
 #  Called automatically by node.sh for child/both roles.
 #
+#  Supports:
+#    x86_64  + CUDA ≤12   →  cu124 wheels (RTX, A100, H100, etc.)
+#    x86_64  + CUDA 13+   →  cu128 wheels
+#    aarch64 + CUDA ≤12   →  cu124 wheels (Jetson AGX Orin, etc.)
+#    aarch64 + CUDA 13+   →  cu130 wheels + vllm.ai nightly (DGX Spark GB10/GB200)
+#
 #  The venv lives at ~/.vllm-venv (no spaces in path) because nvcc/flashinfer
 #  JIT compilation breaks when include paths contain spaces.
 # =============================================================================
@@ -22,6 +28,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 ok()   { echo -e "  ${GREEN}✓${NC}  $1"; }
+info() { echo -e "  ${CYAN}▸${NC}  $1"; }
 warn() { echo -e "  ${YELLOW}!${NC}  $1"; }
 err()  { echo -e "  ${RED}✗${NC}  $1"; }
 step() { echo -e "\n${YELLOW}▶${NC}  $1"; }
@@ -45,17 +52,28 @@ if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
 fi
 ok "System tools checked"
 
-# ── Detect architecture and CUDA driver version ───────────────────────────────
+# ── Detect architecture ───────────────────────────────────────────────────────
 
 ARCH=$(uname -m)
 ok "Architecture: $ARCH"
 
-# Add common CUDA paths so nvcc is findable
-for CUDA_PATH in /usr/local/cuda/bin /usr/local/cuda-12.8/bin /usr/local/cuda-12/bin /usr/local/cuda-13/bin; do
-    [ -d "$CUDA_PATH" ] && [[ ":$PATH:" != *":$CUDA_PATH:"* ]] && export PATH="$CUDA_PATH:$PATH"
+# Map uname arch to the string NVIDIA's keyring URLs use
+case "$ARCH" in
+    x86_64)  KEYRING_ARCH="x86_64" ;;
+    aarch64) KEYRING_ARCH="arm64"  ;;
+    *)       KEYRING_ARCH="x86_64" ; warn "Unknown arch '$ARCH' — defaulting keyring to x86_64" ;;
+esac
+
+# Add all common CUDA toolkit bin paths so nvcc is findable regardless of install location
+for _cpath in \
+    /usr/local/cuda/bin \
+    /usr/local/cuda-13/bin /usr/local/cuda-13.0/bin \
+    /usr/local/cuda-12.8/bin /usr/local/cuda-12/bin \
+    /usr/local/cuda-11/bin; do
+    [ -d "$_cpath" ] && [[ ":$PATH:" != *":$_cpath:"* ]] && export PATH="$_cpath:$PATH"
 done
 
-# ── NVIDIA driver + CUDA check ────────────────────────────────────────────────
+# ── NVIDIA driver + GPU check ─────────────────────────────────────────────────
 
 step "Checking GPU environment..."
 
@@ -71,45 +89,112 @@ if [ "$GPU_COUNT" -lt 1 ]; then
 fi
 ok "$GPU_COUNT GPU(s) detected"
 
-# Print GPU list — handle "Not Supported" memory fields (unified memory hardware)
+# Show GPU list — handle "Not Supported" memory on unified-memory hardware (DGX Spark)
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null \
     | tr -d '\r' \
     | while IFS=, read -r idx name mem; do
-        idx=$(echo "$idx" | xargs)
+        idx=$(echo "$idx"  | xargs)
         name=$(echo "$name" | xargs)
-        mem=$(echo "$mem" | xargs)
+        mem=$(echo "$mem"  | xargs)
         case "${mem,,}" in
             "not supported"|"[n/a]"|"n/a"|"") mem="unified memory" ;;
         esac
         echo "       GPU $idx: $name ($mem)"
     done
 
-# Driver-reported CUDA version (what the installed driver supports)
+# Driver-reported CUDA version
 CUDA_DRIVER_VER=$(nvidia-smi 2>/dev/null | grep -oP "CUDA Version: \K[\d.]+" | head -1 || echo "unknown")
-CUDA_MAJOR=$(echo "$CUDA_DRIVER_VER" | cut -d. -f1)
+CUDA_MAJOR=$(echo "$CUDA_DRIVER_VER" | grep -oP "^\d+" || echo "0")
 ok "Driver CUDA version: $CUDA_DRIVER_VER"
 
-# ── CUDA toolkit (nvcc) — needed for vLLM JIT ─────────────────────────────────
+# ── Select wheel strategy based on arch + CUDA version ───────────────────────
+#
+#  EXTRA_INDICES   — extra-index-url flags passed to every pip install call
+#  AARCH64_CU130   — true when we need the aarch64 cu130 nightly force-upgrade
 
-if ! command -v nvcc &>/dev/null; then
-    warn "nvcc not found — attempting to install cuda-toolkit-12-8..."
-    if command -v apt-get &>/dev/null; then
-        if ! apt-cache show cuda-toolkit-12-8 &>/dev/null 2>&1; then
-            info "Adding NVIDIA package repository..."
-            wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
-                || { warn "Could not download NVIDIA keyring — install cuda-toolkit manually."; }
-            sudo dpkg -i cuda-keyring_1.1-1_all.deb 2>/dev/null
-            sudo apt-get update -qq 2>/dev/null
-            rm -f cuda-keyring_1.1-1_all.deb
-        fi
-        sudo apt-get install -y cuda-toolkit-12-8 2>/dev/null \
-            || warn "cuda-toolkit-12-8 install failed — see https://developer.nvidia.com/cuda-downloads"
+step "Detecting wheel strategy..."
+
+EXTRA_INDICES=()
+AARCH64_CU130=false
+
+if [ "$ARCH" = "aarch64" ]; then
+    if [ "$CUDA_MAJOR" -ge 13 ] 2>/dev/null; then
+        # DGX Spark GB10 / Grace Blackwell — CUDA 13+, aarch64
+        info "aarch64 + CUDA 13 — DGX Spark / Grace Blackwell path"
+        info "Using cu130 index + vllm.ai nightly (SM121 via SM120 forward-compat)"
+        EXTRA_INDICES=(
+            "https://download.pytorch.org/whl/cu130"
+            "https://wheels.vllm.ai/nightly/cu130/"
+        )
+        AARCH64_CU130=true
     else
-        warn "Cannot auto-install CUDA toolkit — install cuda-toolkit-12-8 manually."
+        # Jetson AGX Orin or other aarch64 + CUDA 12
+        info "aarch64 + CUDA 12 — using cu124 index"
+        EXTRA_INDICES=("https://download.pytorch.org/whl/cu124")
     fi
 else
+    # x86_64
+    if [ "$CUDA_MAJOR" -ge 13 ] 2>/dev/null; then
+        info "x86_64 + CUDA 13 — using cu128 index"
+        EXTRA_INDICES=("https://download.pytorch.org/whl/cu128")
+    else
+        info "x86_64 + CUDA 12 — using cu124 index"
+        EXTRA_INDICES=("https://download.pytorch.org/whl/cu124")
+    fi
+fi
+
+for idx in "${EXTRA_INDICES[@]}"; do ok "Index: $idx"; done
+
+# ── CUDA toolkit (nvcc) ───────────────────────────────────────────────────────
+#
+#  vLLM needs nvcc for JIT kernel compilation. The toolkit package to install
+#  depends on both the driver CUDA version and the architecture.
+#
+#  aarch64 + CUDA 13 (DGX Spark): toolkit is pre-installed with the driver;
+#  the vllm.ai cu130 wheels bundle their own CUDA runtime. Missing nvcc is a
+#  warning, not a hard stop.
+
+step "Checking CUDA toolkit (nvcc)..."
+
+if command -v nvcc &>/dev/null; then
     NVCC_VER=$(nvcc --version 2>/dev/null | grep -oP "release \K[\d.]+" | head -1)
     ok "nvcc found (CUDA $NVCC_VER)"
+elif [ "$ARCH" = "aarch64" ] && [ "$CUDA_MAJOR" -ge 13 ] 2>/dev/null; then
+    warn "nvcc not in PATH on DGX Spark — vllm.ai cu130 wheels include CUDA runtime."
+    warn "If vLLM JIT compilation fails later, install the toolkit manually:"
+    warn "  https://developer.nvidia.com/cuda-downloads  (select Linux / aarch64 / Ubuntu)"
+else
+    # Determine the right toolkit package for this driver version
+    if [ "$CUDA_MAJOR" -ge 13 ] 2>/dev/null; then
+        TOOLKIT_PKG="cuda-toolkit-13-0"
+    else
+        TOOLKIT_PKG="cuda-toolkit-12-8"
+    fi
+    warn "nvcc not found — attempting to install $TOOLKIT_PKG..."
+
+    if command -v apt-get &>/dev/null; then
+        if ! apt-cache show "$TOOLKIT_PKG" &>/dev/null 2>&1; then
+            info "Adding NVIDIA package repository (arch: $KEYRING_ARCH)..."
+            KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${KEYRING_ARCH}/cuda-keyring_1.1-1_all.deb"
+            wget -q "$KEYRING_URL" -O /tmp/cuda-keyring.deb \
+                || { warn "Could not download NVIDIA keyring — install CUDA toolkit manually."; }
+            sudo dpkg -i /tmp/cuda-keyring.deb 2>/dev/null
+            sudo apt-get update -qq 2>/dev/null
+            rm -f /tmp/cuda-keyring.deb
+        fi
+        sudo apt-get install -y "$TOOLKIT_PKG" 2>/dev/null \
+            || warn "$TOOLKIT_PKG install failed — see https://developer.nvidia.com/cuda-downloads"
+    else
+        warn "apt-get not available — install $TOOLKIT_PKG manually."
+    fi
+
+    # Re-check after attempted install
+    if command -v nvcc &>/dev/null; then
+        NVCC_VER=$(nvcc --version 2>/dev/null | grep -oP "release \K[\d.]+" | head -1)
+        ok "nvcc installed (CUDA $NVCC_VER)"
+    else
+        warn "nvcc still not found — continuing, but vLLM JIT may fail at runtime."
+    fi
 fi
 
 # ── Python check ──────────────────────────────────────────────────────────────
@@ -152,51 +237,18 @@ PYTHON="$VENV_DIR/bin/python"
 
 "$PIP" install --upgrade pip --quiet
 
-# ── Select pip index based on arch + CUDA version ────────────────────────────
+# ── Install packages ──────────────────────────────────────────────────────────
 
-step "Selecting PyTorch/vLLM wheel index..."
+step "Installing packages from requirements.txt..."
 
-# Extra index URLs to pass to pip
-EXTRA_INDICES=()
+[ ! -f "$REQUIREMENTS" ] && { err "requirements.txt not found at $REQUIREMENTS"; exit 1; }
 
-if [ "$ARCH" = "aarch64" ]; then
-    # aarch64: download.pytorch.org/whl/cu124 has no aarch64 wheels.
-    # cu130 index carries aarch64 CUDA wheels; vllm.ai has official aarch64 builds (v0.10.2+).
-    echo -e "  ${CYAN}aarch64 detected — using cu130 index + vllm.ai wheels${NC}"
-    echo "  (DGX Spark / Grace Blackwell: SM121 uses SM120 forward-compatibility)"
-    EXTRA_INDICES+=(
-        "https://download.pytorch.org/whl/cu130"
-        "https://wheels.vllm.ai/nightly/cu130/"
-    )
-elif [ "$CUDA_MAJOR" = "13" ] 2>/dev/null; then
-    # x86_64 + CUDA 13.x driver: cu130 wheels not yet stable, use cu128
-    echo "  CUDA 13 driver on x86_64 — using cu128 index"
-    EXTRA_INDICES+=("https://download.pytorch.org/whl/cu128")
-else
-    # x86_64 + CUDA ≤12: standard cu124 index
-    EXTRA_INDICES+=("https://download.pytorch.org/whl/cu124")
-fi
-
-for idx in "${EXTRA_INDICES[@]}"; do
-    ok "Index: $idx"
-done
-
-# ── Install / update packages ─────────────────────────────────────────────────
-
-step "Installing / updating packages from requirements.txt..."
-
-if [ ! -f "$REQUIREMENTS" ]; then
-    err "requirements.txt not found at $REQUIREMENTS"
-    exit 1
-fi
-
-# Build the extra-index-url flags
 EXTRA_FLAGS=()
 for idx in "${EXTRA_INDICES[@]}"; do
     EXTRA_FLAGS+=(--extra-index-url "$idx")
 done
 
-# First pass: visible output
+# First pass: show output
 "$PIP" install "${EXTRA_FLAGS[@]}" -r "$REQUIREMENTS" \
     2>&1 | tr -d '\r' | while IFS= read -r line; do
         if echo "$line" | grep -qiE "^error|^fatal|could not find a version|no matching distribution"; then
@@ -204,7 +256,7 @@ done
         elif echo "$line" | grep -qiE "^successfully installed"; then
             ok "$line"
         elif echo "$line" | grep -qiE "already satisfied"; then
-            : # suppress noise
+            :
         else
             echo "     $line"
         fi
@@ -213,50 +265,40 @@ done
 # Second pass: capture exit code (pipe above masks it)
 "$PIP" install "${EXTRA_FLAGS[@]}" -r "$REQUIREMENTS" --quiet 2>&1
 PIP_EXIT=$?
+[ $PIP_EXIT -ne 0 ] && { err "pip install failed (exit $PIP_EXIT)"; exit 1; }
 
-if [ $PIP_EXIT -ne 0 ]; then
-    err "pip install failed (exit $PIP_EXIT) — check output above."
-    exit 1
-fi
+# ── aarch64 + CUDA 13: force cu130 vllm wheel ────────────────────────────────
+#
+#  pip prefers PyPI's stable vllm (built against CUDA 12) over the cu130 nightly
+#  even when the cu130 index is listed. The stable wheel links libcudart.so.12,
+#  which doesn't exist on a CUDA-13-only system. Fix: force-upgrade with --pre
+#  so pip picks the cu130 nightly that links libcudart.so.13.
 
-# ── aarch64: force the cu130 vllm wheel ───────────────────────────────────────
-# On aarch64, PyPI's stable vllm is compiled against CUDA 12 and links libcudart.so.12,
-# which does not exist on a cu13-only system (GB10 / Grace Blackwell). The
-# --extra-index-url to wheels.vllm.ai/nightly/cu130 alone does not help, because the
-# cu130 wheel is a pre-release and pip prefers PyPI's stable version without --pre.
-# So: after the main resolve, force-upgrade vllm (with its deps) from the cu130 index
-# with --pre enabled. This pulls vllm-*+cu130 and bumps torch/flashinfer to matching
-# versions. No-op on x86_64.
-if [ "$ARCH" = "aarch64" ]; then
-    step "aarch64: pinning vllm + torch to cu130 nightly build..."
+if [ "$AARCH64_CU130" = "true" ]; then
+    step "aarch64 + CUDA 13: pinning vllm to cu130 nightly..."
     "$PIP" install --pre --upgrade vllm \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
         --extra-index-url https://wheels.vllm.ai/nightly/cu130/ \
         --quiet 2>&1
-    AARCH_PIP_EXIT=$?
-    if [ $AARCH_PIP_EXIT -ne 0 ]; then
-        err "cu130 vllm install failed (exit $AARCH_PIP_EXIT)."
-        exit 1
-    fi
+    AARCH_EXIT=$?
+    [ $AARCH_EXIT -ne 0 ] && { err "cu130 vllm pin failed (exit $AARCH_EXIT)"; exit 1; }
     ok "cu130 vllm wheel installed"
 fi
 
-# ── Verify critical imports ───────────────────────────────────────────────────
+# ── Verify imports ────────────────────────────────────────────────────────────
 
 step "Verifying installs..."
 
 check_import() {
-    local pkg=$1
-    local import_name=${2:-$1}
+    local pkg=$1 import_name=${2:-$1}
     if "$PYTHON" -c "import $import_name" 2>/dev/null; then
-        VERSION=$("$PYTHON" -c "
+        local ver
+        ver=$("$PYTHON" -c "
 import $import_name, importlib.metadata
-try:
-    print(importlib.metadata.version('$pkg'))
-except Exception:
-    print(getattr($import_name, '__version__', 'unknown'))
+try:    print(importlib.metadata.version('$pkg'))
+except: print(getattr($import_name, '__version__', 'unknown'))
 " 2>/dev/null || echo "unknown")
-        ok "$pkg $VERSION"
+        ok "$pkg $ver"
     else
         err "$pkg import failed — check pip output above"
         return 1
@@ -264,37 +306,36 @@ except Exception:
 }
 
 FAILED=0
-check_import "vllm"              || FAILED=1
-check_import "litellm"           || FAILED=1
-check_import "huggingface_hub"   || FAILED=1
-check_import "torch"             || FAILED=1
+check_import "vllm"            || FAILED=1
+check_import "litellm"         || FAILED=1
+check_import "huggingface_hub" || FAILED=1
+check_import "torch"           || FAILED=1
+check_import "duckdb"          || FAILED=1
 
-if [ $FAILED -ne 0 ]; then
-    err "One or more imports failed — the stack cannot start."
-    exit 1
-fi
+[ $FAILED -ne 0 ] && { err "One or more imports failed — the stack cannot start."; exit 1; }
 
-# vllm._C exercises the CUDA-linked C extension — top-level `import vllm` does not.
-# This is what actually fails when the installed wheel was built against the wrong
-# CUDA (e.g. a cu12 wheel on a cu13-only host). Without this check, setup would
-# appear to succeed and the problem would only surface at `vllm serve` launch.
+# vllm._C is the CUDA-linked C extension. top-level `import vllm` succeeds even
+# when the wheel was built against the wrong CUDA. This catches that case early.
 if ! "$PYTHON" -c "import vllm._C" 2>/tmp/vllm_c_err; then
-    err "vllm._C import failed — C extension is unusable."
-    echo "  --- import error ---"
+    err "vllm._C import failed — C extension is unusable (wrong CUDA build?)."
     sed 's/^/  /' /tmp/vllm_c_err
-    echo "  --------------------"
-    echo "  Likely cause: wrong CUDA wheel for this host's driver/arch."
-    echo "  On aarch64 + cu13, ensure the cu130 nightly vllm wheel is installed:"
-    echo "    $PIP install --pre --upgrade vllm \\"
-    echo "      --extra-index-url https://download.pytorch.org/whl/cu130 \\"
-    echo "      --extra-index-url https://wheels.vllm.ai/nightly/cu130/"
+    echo ""
+    if [ "$AARCH64_CU130" = "true" ]; then
+        echo "  Try manually:"
+        echo "    $PIP install --pre --upgrade vllm \\"
+        echo "      --extra-index-url https://download.pytorch.org/whl/cu130 \\"
+        echo "      --extra-index-url https://wheels.vllm.ai/nightly/cu130/"
+    else
+        echo "  Ensure the correct CUDA wheel is installed for your driver version."
+        echo "  Run: $PYTHON -c \"import torch; print(torch.__version__, torch.version.cuda)\""
+    fi
     rm -f /tmp/vllm_c_err
     exit 1
 fi
 rm -f /tmp/vllm_c_err
-ok "vllm._C loaded (CUDA extension usable)"
+ok "vllm._C loaded"
 
-# ── Verify CUDA is visible to torch (fatal on inference nodes) ────────────────
+# ── Verify torch CUDA ─────────────────────────────────────────────────────────
 
 TORCH_CUDA=$("$PYTHON" -c "import torch; print(torch.cuda.is_available())" 2>/dev/null)
 if [ "$TORCH_CUDA" = "True" ]; then
@@ -302,24 +343,18 @@ if [ "$TORCH_CUDA" = "True" ]; then
     ok "torch CUDA available (compiled against CUDA $TORCH_CUDA_VER)"
 else
     echo ""
-    err "torch.cuda.is_available() = False"
-    err "torch installed as CPU-only — vLLM cannot use the GPU in this state."
+    err "torch.cuda.is_available() = False — GPU will not be used."
     echo ""
     if [ "$ARCH" = "aarch64" ]; then
-        echo "  aarch64 install tip:"
-        echo "    The cu130 wheel index was used. If this failed, try manually:"
+        echo "  aarch64 tip: ensure the cu130 torch wheel was installed:"
         echo "    $PIP install torch --index-url https://download.pytorch.org/whl/cu130"
-        echo "    $PIP install vllm --extra-index-url https://wheels.vllm.ai/nightly/cu130/"
-        echo ""
-        echo "  For DGX Spark (SM121): vLLM ≥0.10.2 supports aarch64 via SM120 forward-compat."
-        echo "  If wheels are unavailable, use NVIDIA's container image:"
-        echo "    nvcr.io/nvidia/cuda:latest"
     else
-        echo "  Verify the CUDA wheel was installed:"
-        echo "    $PYTHON -c \"import torch; print(torch.__version__, torch.version.cuda)\""
-        echo "  If it shows '+cpu', re-run with the correct index for your CUDA version:"
-        echo "    CUDA 12.x: https://download.pytorch.org/whl/cu124"
-        echo "    CUDA 13.x: https://download.pytorch.org/whl/cu128"
+        echo "  Run: $PYTHON -c \"import torch; print(torch.__version__, torch.version.cuda)\""
+        if [ "$CUDA_MAJOR" -ge 13 ] 2>/dev/null; then
+            echo "  CUDA 13 detected — expected index: https://download.pytorch.org/whl/cu128"
+        else
+            echo "  CUDA 12 detected — expected index: https://download.pytorch.org/whl/cu124"
+        fi
     fi
     echo ""
     exit 1
