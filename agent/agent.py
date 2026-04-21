@@ -4,6 +4,7 @@ Runs on the GPU machine. Exposes a REST API for the dashboard (VM or local).
 Port: 5000
 """
 
+import concurrent.futures
 import json
 import os
 import signal
@@ -183,20 +184,39 @@ def _proxy_write_and_restart(
         return
 
     with _PROXY_LOCK:
-        instances = _scan_vllm_instances()
-
-        # Build deduplicated (served_name, ip, port) set
+        # Build deduplicated (served_name, ip, port) set across all nodes
         seen: set[tuple] = set()
-        for inst in instances:
+
+        # Local instances
+        for inst in _scan_vllm_instances():
             s, p = inst.get("served_name"), inst.get("port")
             if s and p and s != remove_served:
                 seen.add((s, THIS_IP, p))
 
+        # Child node instances — query each node's agent in parallel
+        child_nodes = [
+            n for n in (_NODE_CFG.get("nodes") or [])
+            if n.get("ip") and n.get("ip") != THIS_IP
+        ]
+        def _fetch_child(node: dict):
+            ip   = node["ip"]
+            port = node.get("agent_port", 5000)
+            data = _http_get(f"http://{ip}:{port}/instances")
+            return ip, data or []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(child_nodes) or 1) as ex:
+            for child_ip, child_insts in ex.map(_fetch_child, child_nodes):
+                for inst in child_insts:
+                    s, p = inst.get("served_name"), inst.get("port")
+                    if s and p and s != remove_served:
+                        seen.add((s, child_ip, p))
+
         if extra_add:
             s = extra_add.get("served_name")
             p = extra_add.get("port")
+            host = extra_add.get("ip", THIS_IP)
             if s and p:
-                seen.add((s, THIS_IP, p))
+                seen.add((s, host, p))
 
         entries = []
         for served_name, host_ip, port in sorted(seen):
