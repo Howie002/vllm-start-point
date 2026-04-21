@@ -12,3 +12,9 @@ litellm[proxy]>=1.83.0
 
 # HuggingFace tooling — model downloads, auth
 huggingface_hub>=0.23.0
+
+# DuckDB — analytics engine that reads JSONL metrics files directly.
+# Used by the agent to aggregate per-minute samples into hourly (or any
+# resolution) time-series for the dashboard's Analytics tab. No schema
+# migrations, no write-path DB, just SQL over append-only files.
+duckdb>=1.0.0

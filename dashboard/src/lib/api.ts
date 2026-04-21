@@ -1,4 +1,8 @@
-import type { FullStatus, ModelEntry, LaunchRequest, NodeConfig, StackConfig, StackModelConfig, PreflightResult, RepackResult, RepackAssignment } from "./types";
+import type {
+  FullStatus, ModelEntry, LaunchRequest, NodeConfig, StackConfig, StackModelConfig,
+  PreflightResult, RepackResult, RepackAssignment, MetricsQueryResult,
+  HFTokenStatus, HFLookup, CachedModel, CacheStats, DownloadState,
+} from "./types";
 
 // Build a direct URL to a node's agent (browser calls this cross-origin)
 function agentBase(node: NodeConfig): string {
@@ -58,6 +62,21 @@ export function createNodeApi(node: NodeConfig) {
     toggleModel:          (id: string, enabled: boolean)           => fetch(`${base}/models/library/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }).then(r => r.json()) as Promise<ModelEntry>,
     addModel:             (entry: Partial<ModelEntry>)             => post<ModelEntry>             (base, "/models/library", entry),
     deleteModel:          (id: string)                             => del<{ deleted: string }>     (base, `/models/library/${encodeURIComponent(id)}`),
+    metrics:              (range: string, resolution: string)      => get<MetricsQueryResult>      (base, `/metrics/query?range=${range}&resolution=${resolution}`),
+
+    // HF integration — per node
+    hfTokenStatus:   ()                      => get<HFTokenStatus> (base, "/models/hf/token"),
+    hfTokenSet:      (token: string)         => post<HFTokenStatus>(base, "/models/hf/token", { token }),
+    hfTokenClear:    ()                      => del<HFTokenStatus> (base, "/models/hf/token"),
+    hfLookup:        (model_id: string)      => get<HFLookup>      (base, `/models/hf/lookup/${encodeURIComponent(model_id)}`),
+    hfPreflight:     (model_id: string)      => get<HFLookup>      (base, `/models/hf/preflight/${encodeURIComponent(model_id)}`),
+    cacheListing:    ()                      => get<CachedModel[]> (base, "/models/cache"),
+    cacheStats:      ()                      => get<CacheStats>    (base, "/models/cache/stats"),
+    cacheDelete:     (model_id: string)      => del<{ deleted: boolean; bytes_freed?: number }>(base, `/models/cache/${encodeURIComponent(model_id)}`),
+    hfDownloadStart:  (model_id: string)     => post<DownloadState>(base, "/models/hf/download", { model_id }),
+    hfDownloadStatus: (model_id: string)     => get<DownloadState> (base, `/models/hf/download/${encodeURIComponent(model_id)}`),
+    hfDownloadCancel: (model_id: string)     => del<{ canceled: boolean }>(base, `/models/hf/download/${encodeURIComponent(model_id)}`),
+    hfDownloads:      ()                     => get<DownloadState[]>(base, "/models/hf/downloads"),
   };
 }
 
@@ -66,4 +85,38 @@ export async function fetchNodes(): Promise<NodeConfig[]> {
   const res = await fetch("/api/nodes", { cache: "no-store" });
   if (!res.ok) return [{ name: "Local", ip: "localhost", agent_port: 5000 }];
   return res.json();
+}
+
+// Identify the master node from a list of nodes + their statuses. The master
+// is whichever node hosts the cluster LiteLLM proxy; every agent reports that
+// same URL via /status, so we just match the proxy's host back to a node IP.
+//
+// Library operations route to the master so add/edit/delete go to one place
+// (master is the authority). Fallback: if no proxy URL is reachable yet, use
+// the first online node so first-run scenarios still work.
+import type { ClusterNodeStatus } from "./types";
+export function findMasterNode(nodes: NodeConfig[], nodeStatuses: ClusterNodeStatus[]): NodeConfig | null {
+  for (const ns of nodeStatuses) {
+    const url = ns.status?.proxy.url;
+    if (!url) continue;
+    const host = url.replace(/^https?:\/\//, "").split(":")[0];
+    const match = nodes.find(n => n.ip === host);
+    if (match) return match;
+  }
+  return nodeStatuses.find(ns => !!ns.status)?.node ?? nodes[0] ?? null;
+}
+
+
+// Rename a registered node. Routes through Next.js so the canonical nodes[] on
+// master gets updated regardless of which dashboard the user is browsing.
+export async function renameNode(ip: string, agent_port: number, name: string): Promise<void> {
+  const res = await fetch("/api/nodes/rename", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ip, agent_port, name }),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(detail || `rename → ${res.status}`);
+  }
 }

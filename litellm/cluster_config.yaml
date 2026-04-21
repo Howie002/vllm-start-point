@@ -1,0 +1,23 @@
+# Cluster LiteLLM proxy — empty seed.
+#
+# Models are registered dynamically via POST /model/new by each node's control
+# agent when it launches a vLLM instance. No static model list here.
+#
+# For the legacy single-node setup with hardcoded ports, use ../litellm_config.yaml.
+
+model_list: []
+
+router_settings:
+  routing_strategy: least-busy
+  num_retries: 3
+  timeout: 30
+  retry_after: 5
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+
+general_settings:
+  master_key: "none"
+  # Allow dynamic registration without a DB backend.
+  store_model_in_db: false

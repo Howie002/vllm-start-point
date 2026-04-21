@@ -219,6 +219,28 @@ if [ $PIP_EXIT -ne 0 ]; then
     exit 1
 fi
 
+# ── aarch64: force the cu130 vllm wheel ───────────────────────────────────────
+# On aarch64, PyPI's stable vllm is compiled against CUDA 12 and links libcudart.so.12,
+# which does not exist on a cu13-only system (GB10 / Grace Blackwell). The
+# --extra-index-url to wheels.vllm.ai/nightly/cu130 alone does not help, because the
+# cu130 wheel is a pre-release and pip prefers PyPI's stable version without --pre.
+# So: after the main resolve, force-upgrade vllm (with its deps) from the cu130 index
+# with --pre enabled. This pulls vllm-*+cu130 and bumps torch/flashinfer to matching
+# versions. No-op on x86_64.
+if [ "$ARCH" = "aarch64" ]; then
+    step "aarch64: pinning vllm + torch to cu130 nightly build..."
+    "$PIP" install --pre --upgrade vllm \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        --extra-index-url https://wheels.vllm.ai/nightly/cu130/ \
+        --quiet 2>&1
+    AARCH_PIP_EXIT=$?
+    if [ $AARCH_PIP_EXIT -ne 0 ]; then
+        err "cu130 vllm install failed (exit $AARCH_PIP_EXIT)."
+        exit 1
+    fi
+    ok "cu130 vllm wheel installed"
+fi
+
 # ── Verify critical imports ───────────────────────────────────────────────────
 
 step "Verifying installs..."
@@ -251,6 +273,26 @@ if [ $FAILED -ne 0 ]; then
     err "One or more imports failed — the stack cannot start."
     exit 1
 fi
+
+# vllm._C exercises the CUDA-linked C extension — top-level `import vllm` does not.
+# This is what actually fails when the installed wheel was built against the wrong
+# CUDA (e.g. a cu12 wheel on a cu13-only host). Without this check, setup would
+# appear to succeed and the problem would only surface at `vllm serve` launch.
+if ! "$PYTHON" -c "import vllm._C" 2>/tmp/vllm_c_err; then
+    err "vllm._C import failed — C extension is unusable."
+    echo "  --- import error ---"
+    sed 's/^/  /' /tmp/vllm_c_err
+    echo "  --------------------"
+    echo "  Likely cause: wrong CUDA wheel for this host's driver/arch."
+    echo "  On aarch64 + cu13, ensure the cu130 nightly vllm wheel is installed:"
+    echo "    $PIP install --pre --upgrade vllm \\"
+    echo "      --extra-index-url https://download.pytorch.org/whl/cu130 \\"
+    echo "      --extra-index-url https://wheels.vllm.ai/nightly/cu130/"
+    rm -f /tmp/vllm_c_err
+    exit 1
+fi
+rm -f /tmp/vllm_c_err
+ok "vllm._C loaded (CUDA extension usable)"
 
 # ── Verify CUDA is visible to torch (fatal on inference nodes) ────────────────
 

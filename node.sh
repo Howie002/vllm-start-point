@@ -74,16 +74,27 @@ PY
 }
 
 write_config() {
-    # All values passed as env vars — avoids quoting/injection issues
+    # All values passed as env vars — avoids quoting/injection issues.
+    # cluster_proxy: where model registrations are POSTed. For master/both it's
+    # this node's own :4000; for child it's master_ip:4000.
     python3 - "$CONFIG_FILE" <<'PY'
 import json, os, sys
+role       = os.environ["CFG_ROLE"]
+this_ip    = os.environ["CFG_THIS_IP"]
+master_ip  = os.environ["CFG_MASTER_IP"]
+proxy_ip   = this_ip if role in ("master", "both") else master_ip
+proxy_port = int(os.environ.get("CFG_PROXY_PORT", "4000"))
 cfg = {
-    "role":    os.environ["CFG_ROLE"],
-    "this_ip": os.environ["CFG_THIS_IP"],
+    "role":    role,
+    "this_ip": this_ip,
     "master": {
-        "ip":             os.environ["CFG_MASTER_IP"],
+        "ip":             master_ip,
         "agent_port":     int(os.environ.get("CFG_MASTER_AGENT_PORT", "5000")),
         "dashboard_port": int(os.environ["CFG_DASH_PORT"])
+    },
+    "cluster_proxy": {
+        "ip":   proxy_ip,
+        "port": proxy_port,
     },
     "agent_port": int(os.environ["CFG_AGENT_PORT"]),
     "nodes":      json.loads(os.environ.get("CFG_NODES", "[]"))
@@ -373,8 +384,16 @@ PY
     fi
 
     echo ""
-    success "Setup complete — starting services now..."
+    success "Setup complete — restarting services to pick up the new code..."
     echo ""
+    # Stop-first guards against "already running" failures on re-setup. Without
+    # this, pulling new code and re-running setup would leave the old agent /
+    # proxy / dashboard processes in place — pre-edit code still serving.
+    _CLEAN_EXIT=true  # suppress the "Press Enter" prompts from do_stop/do_start chain
+    bash "$SCRIPT_DIR/dashboard/stop_dashboard.sh" 2>/dev/null || true
+    bash "$SCRIPT_DIR/litellm/stop_proxy.sh"       2>/dev/null || true
+    bash "$SCRIPT_DIR/agent/stop_agent.sh"         2>/dev/null || true
+    _CLEAN_EXIT=false
     do_start
 }
 
@@ -521,6 +540,13 @@ do_start() {
             || warn "Agent start reported errors — check agent/agent.log"
     fi
 
+    # LiteLLM cluster proxy runs only on master/both — one per cluster, not per node.
+    if [ "$role" = "master" ] || [ "$role" = "both" ]; then
+        info "Starting LiteLLM cluster proxy (port 4000)..."
+        PROXY_BIND_IP="$this_ip" bash "$SCRIPT_DIR/litellm/start_proxy.sh" \
+            || warn "LiteLLM proxy start reported errors — check logs/litellm.log"
+    fi
+
     info "Starting dashboard (port $dashboard_port)..."
     AGENT_URL="http://localhost:$agent_port" \
     DASHBOARD_PORT="$dashboard_port" \
@@ -532,8 +558,11 @@ do_start() {
     echo -e "  Dashboard  →  ${CYAN}http://$this_ip:$dashboard_port${RESET}"
     if [ "$role" != "master" ]; then
         echo -e "  Agent      →  ${CYAN}http://$this_ip:$agent_port${RESET}"
-        echo -e "  LiteLLM    →  ${CYAN}http://$this_ip:4000${RESET}"
     fi
+    local proxy_ip proxy_port
+    proxy_ip=$(cfg_get "['cluster_proxy']['ip']" "$master_ip")
+    proxy_port=$(cfg_get "['cluster_proxy']['port']" "4000")
+    echo -e "  LiteLLM    →  ${CYAN}http://$proxy_ip:$proxy_port/v1${RESET}  (cluster entry point)"
     echo ""
     read -rp "Press Enter to close..." _
     _CLEAN_EXIT=true
@@ -543,6 +572,7 @@ do_start() {
 do_stop() {
     header "Stopping local services"
     [ -f "$SCRIPT_DIR/dashboard/stop_dashboard.sh" ]    && bash "$SCRIPT_DIR/dashboard/stop_dashboard.sh"    || true
+    [ -f "$SCRIPT_DIR/litellm/stop_proxy.sh" ]          && bash "$SCRIPT_DIR/litellm/stop_proxy.sh"          || true
     [ -f "$SCRIPT_DIR/agent/stop_agent.sh" ]            && bash "$SCRIPT_DIR/agent/stop_agent.sh"            || true
     [ -f "$SCRIPT_DIR/stop_inference_stack.sh" ]        && bash "$SCRIPT_DIR/stop_inference_stack.sh"        || true
     success "Done."
@@ -575,6 +605,14 @@ do_status() {
             success "Dashboard  :$dp  UP"
         else
             warn "Dashboard  :$dp  DOWN"
+        fi
+
+        local pp
+        pp=$(cfg_get "['cluster_proxy']['port']" "4000")
+        if curl -sf --connect-timeout 3 --header 'Authorization: Bearer none' "http://localhost:$pp/v1/models" &>/dev/null; then
+            success "LiteLLM    :$pp  UP"
+        else
+            warn "LiteLLM    :$pp  DOWN"
         fi
     fi
 

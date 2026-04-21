@@ -6,6 +6,12 @@ Features planned for future development, prioritised roughly by value. Nothing h
 
 ## Recently Completed
 
+- **Model Library v2 — per-node download & disk management** — every library row now shows per-node cache status with on-disk size, Download/Delete buttons, and live pre-pull progress bars polled from `/models/hf/downloads`. Top strip shows per-node disk headroom with a warning above 85% usage
+- **HuggingFace token management** — per-node token set/clear from the dashboard; tokens are written to `~/.cache/huggingface/token` on the actual node and masked in the UI
+- **HF link-based importer** — paste a HuggingFace URL or `org/repo`; agent's `/models/hf/lookup` hits the HF API and prefills params, VRAM estimate, quant guess, context length, type, and license; user reviews before saving to the library
+- **Kill silent HF gating** — `/models/hf/preflight` + `auth_check` integration in `/instances/launch` now blocks gated-and-unauthorized deploys with a readable 403 error instead of letting vLLM fail silently in its own log
+- **Analytics tab** — per-node 1-minute sampler writes append-only JSONL; DuckDB aggregates to any resolution at query time; 30-day retention with daily file rotation; dashboard charts GPU utilization, requests/bucket (stacked by model), prompt+generation tokens, TTFT p95, plus cluster totals and queue-depth peak
+- **Cluster-wide LiteLLM proxy** — single proxy on master serves every node's vLLM instances under one URL; agents register models dynamically using their real node IP; per-node proxy config retired; node.sh lifecycle starts/stops the proxy on master/both roles
 - **Cluster-unified GPU view** — all GPUs from all nodes in one flat grid; node badge per card; click to expand for temperature, power, clock, fan
 - **Cluster-unified service list** — all vLLM instances across nodes in one table; expandable rows with context length, quant, tensor parallel, direct endpoint
 - **Cross-cluster deployment** — Deploy modal picks GPUs from any node; `targetNode` derived from the selected GPU
@@ -22,15 +28,14 @@ Features planned for future development, prioritised roughly by value. Nothing h
 
 ## In Progress
 
-### Utilization Logging & Analytics
-Track per-model request activity and GPU usage over time so sizing decisions are based on real data rather than guesses.
+### Analytics — follow-on work
+The v1 analytics tab ships with per-node 1-minute sampling, DuckDB aggregation, and a fixed set of charts. Remaining items to close out the full feature:
 
-- [ ] Per-minute sampling: active models, GPU utilisation, VRAM, in-flight requests
-- [ ] SQLite store at `logs/utilization.db` — zero external dependencies
-- [ ] Hourly and system-level aggregate endpoints on the agent
-- [ ] Usage chart in dashboard (GPU util over time, per-model activity breakdown)
-- [ ] CSV/JSON export from dashboard
-- [ ] Retention policy — auto-prune samples older than N days
+- [ ] CSV/JSON export from the Analytics tab (download current window)
+- [ ] Co-residency timeline band — render the `coresident_pct` metric as a colored strip under each GPU's utilization line so "when did two models share this GPU?" is instantly visible
+- [ ] Error rate panel — parse LiteLLM `/metrics` for 4xx/5xx per model; show only when non-zero
+- [ ] Per-model zoom: click a model in the legend → drill-down view with requests, tokens, TTFT, queue depth aligned
+- [ ] Backfill tolerance — gracefully handle clock skew across nodes when combining buckets (currently assumes nodes agree on minute boundaries)
 
 ---
 
@@ -52,14 +57,39 @@ Webhook or email notification when `requests_waiting` is non-zero for more than 
 
 ## Phase 3 — Multi-Node Operations
 
-**Cross-node LiteLLM routing**
-Single LiteLLM proxy that load-balances across vLLM instances on *different* machines, not just different GPUs on one box. Today each node has its own proxy.
-
 **Unified request analytics across nodes**
 The usage chart currently shows one node at a time. Aggregate across all registered nodes so total cluster load is visible in one view.
 
 **Cross-node model migration**
 Move a running model from one GPU/node to another via the dashboard — drain connections, launch on target, deregister source.
+
+**Dynamic cluster partitioning (dual-master sandbox)**
+Split the node pool into two (or more) independent clusters from the same physical hardware — a production partition and a staging/testing/batch partition. Each partition has its own master (dashboard + LiteLLM proxy), its own model library authority, its own analytics JSONL, and its own set of assigned nodes; traffic and deploys are isolated between them. Mechanism: add a `partition` field to `node_config.json` and to each node entry in `nodes[]`; the master that serves a partition only shows/manages nodes whose partition matches. A "Fork partition" action in the dashboard picks which of the current nodes come along to the new partition, promotes one as its master, re-registers its agents to point at the new master's proxy, and leaves the production master untouched. Nodes can move between partitions via the dashboard without a service restart — just a config push + proxy re-registration.
+
+Two driving use cases:
+1. **Testing** — try new vLLM versions, new model combos, or a risky node.sh change on a subset of hardware without taking the production cluster offline.
+2. **Heavy batch isolation** — when a batch workload (eval sweeps, embedding a large corpus, fine-tuning feedback loops) would otherwise hammer interactive production traffic, peel off a few nodes into a batch partition so the network, GPU queues, and VRAM pressure stay contained. When the batch finishes, merge the nodes back.
+
+**Zero-downtime rolling restart**
+One-click "restart everything cleanly" — bring the cluster back to a known-good state without dropping in-flight inference. Agent/dashboard/proxy restarts individually today already lose any model registrations that weren't persisted, and a full `node.sh stop && start` kills every vLLM worker. Mechanism: for each node in sequence, drain its LiteLLM traffic (set weight → 0), wait for in-flight requests, restart the agent and dashboard, replay registered models from a saved manifest (`.cluster_state.json`), verify health, then restore traffic weight. Proxy restarts go last and use a pre-warmed config so there's no registration gap. End state is a fully-refreshed stack with no observable downtime to clients. Builds on cross-node migration + request analytics (to know when "drained" is actually drained).
+
+---
+
+## Model Library — follow-on work
+
+v1 (per-node download / delete / token / importer / gating precheck) shipped above. Remaining items in this area:
+
+**Library propagation across nodes**
+Today, a model added via "+ Import from HF" writes to `model_library.json` on the node whose agent the modal talked to. The dashboard pulls from a single node so it *looks* right, but the entry isn't replicated to other nodes. Either (a) each add writes to every online node's library, or (b) promote the master's library as the authoritative copy and have other nodes read through it. (b) is cleaner but requires new API surface.
+
+**Shared HF cache (NFS/SMB)**
+Scalable fix for per-node duplication. Instead of `~/.cache/huggingface/hub/` living on each node's local disk, mount a shared volume. One 50 GB download serves the whole cluster. Requires: an install-time option to configure the cache path, plus some care with concurrent-write locking (`huggingface_hub` already handles this via `.lock` files so may Just Work). Low urgency until the cluster grows past 2-3 nodes or disk cost becomes a concern.
+
+**Resume / parallelize downloads**
+Downloads currently run one-at-a-time per model, serially per node. huggingface_hub already does parallel-file fetch internally; what's missing is: visible per-file progress within a download, ability to kick off downloads on every node at once with one click ("pre-warm cluster"), and a visible queue when multiple downloads are requested.
+
+**Download priority / throttling**
+A single 50 GB model download can saturate network and disk on a smaller node. Add a bandwidth/concurrency limit per node, configurable in `node_config.json`.
 
 ---
 
@@ -96,6 +126,9 @@ Push events (model healthy, model crashed, GPU OOM, scale-up triggered) to a con
 ---
 
 ## Phase 6 — Infrastructure
+
+**Device-profile setup presets**
+Today `node.sh setup` asks generic questions (role, IP, port) and a single aarch64-vs-x86_64 switch picks wheels. Real deployments tend to be a handful of well-known platforms — DGX Spark (GB10), HP Z8 Linux + RTX PRO 6000 Blackwell, Jetson, generic x86_64 + consumer RTX, etc. Add a device-type picker to the setup flow that expands into a preset: correct wheel index (cu130 nightly vs cu128 stable), torch pin, vLLM channel (pre vs stable), default GPU layout in `stack_configs.json`, expected SM/compute-cap warnings, and any platform-specific quirks (unified memory, NVLink topology, MIG). A profile registry (`setup_profiles/*.yaml` or similar) keeps the logic out of the shell script and makes new hardware trivial to onboard — add a profile, pick it at setup.
 
 **Docker Compose deployment**
 Alternative to the current bare-metal install: a `docker-compose.yml` that containerises the agent, dashboard, and LiteLLM proxy. vLLM itself still runs on the host for GPU passthrough.

@@ -37,6 +37,9 @@ export interface VLLMInstance {
 export interface ProxyStatus {
   healthy: boolean;
   models: string[];
+  // URL of the cluster LiteLLM proxy the agent is reporting on. Same for every
+  // node in the cluster (one proxy per cluster, lives on master/both).
+  url?: string;
 }
 
 export interface FullStatus {
@@ -143,4 +146,89 @@ export interface LaunchRequest {
   served_name: string;
   register_with_proxy: boolean;
   extra_flags: Record<string, unknown>;
+}
+
+// ── Analytics ───────────────────────────────────────────────────────────────
+// One row per (time bucket × GPU) from a single node's history.
+export interface MetricsGpuBucket {
+  bucket_ts: number;
+  gpu_idx: number;
+  util_pct_avg: number | null;
+  util_pct_p95: number | null;
+  vram_used_mb_avg: number | null;
+  vram_used_mb_max: number | null;
+  coresident_pct: number | null;
+  power_w_avg: number | null;
+  temp_c_avg: number | null;
+}
+
+// One row per (time bucket × served_name × gpu) from a single node's history.
+// Token counts and request counts are deltas within the bucket, not cumulative.
+export interface MetricsModelBucket {
+  bucket_ts: number;
+  served_name: string;
+  gpu_idx: number | null;
+  prompt_tokens: number;
+  generation_tokens: number;
+  requests: number;
+  running_avg: number | null;
+  running_max: number | null;
+  waiting_avg: number | null;
+  waiting_max: number | null;
+  ttft_p50_ms_avg: number | null;
+  ttft_p95_ms_avg: number | null;
+}
+
+export interface MetricsQueryResult {
+  range: string;
+  resolution: string;
+  since_ts: number;
+  gpus: MetricsGpuBucket[];
+  models: MetricsModelBucket[];
+}
+
+// ── HF integration ──────────────────────────────────────────────────────────
+export interface HFTokenStatus {
+  set: boolean;
+  preview?: string;
+}
+
+export interface HFLookup {
+  status: "ok" | "gated_unauthorized" | "not_found" | "network_error";
+  model_id: string;
+  message?: string;
+  gated?: boolean;
+  pipeline_tag?: string;
+  type?: "chat" | "reasoning" | "embedding";
+  params_b?: number | null;
+  total_bytes?: number;
+  vram_gb_estimate?: number | null;
+  quant_guess?: string;
+  context_length?: number | null;
+  tags?: string[];
+  license?: string | null;
+}
+
+export interface CachedModel {
+  model_id: string;
+  size_bytes: number;
+  path: string;
+}
+
+export interface CacheStats {
+  cache_used_bytes: number;
+  disk_total_bytes: number;
+  disk_used_bytes: number;
+  disk_free_bytes: number;
+  cache_path: string;
+}
+
+export interface DownloadState {
+  model_id: string;
+  state: "pending" | "downloading" | "complete" | "error" | "canceled";
+  bytes_done: number;
+  bytes_total: number;
+  started_at: number;
+  finished_at?: number | null;
+  error?: string | null;
 }

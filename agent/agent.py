@@ -22,20 +22,54 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from metrics import MetricsSampler, query_metrics
+import models_hf
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 VLLM_BIN       = os.path.expanduser("~/.vllm-venv/bin/vllm")
-LITELLM_URL    = "http://localhost:4000"
 LITELLM_KEY    = "none"
 SCAN_PORT_MIN  = 8000
-SCAN_PORT_MAX  = 8020
+# Must cover the range DeployModal.tsx allocates from (currently 8020–8099).
+# Previously capped at 8020, which missed every instance beyond the first.
+SCAN_PORT_MAX  = 8099
 LIBRARY_PATH   = Path(__file__).parent / "model_library.json"
 STACK_CONFIGS_PATH = Path(__file__).parent.parent / "stack_configs.json"
+NODE_CONFIG_PATH   = Path(__file__).parent.parent / "node_config.json"
 HF_CACHE       = Path.home() / ".cache" / "huggingface" / "hub"
 CUDA_ENV = {
     **os.environ,
     "PATH": f"{Path.home()}/.vllm-venv/bin:/usr/local/cuda-12.8/bin:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
 }
+
+
+# ── Node config (read once at import; cheap to re-read if needed) ─────────────
+# `this_ip` is the externally-reachable IP the agent reports + uses when
+# registering model backends with the cluster proxy. `cluster_proxy` is where
+# model registrations are POSTed — on a master/both node it points at this
+# node's own :4000; on a child node it points at the master's :4000.
+
+def _load_node_config() -> dict:
+    try:
+        with open(NODE_CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+_NODE_CFG = _load_node_config()
+
+THIS_IP = _NODE_CFG.get("this_ip") or "localhost"
+
+def _cluster_proxy_url() -> str:
+    cp = _NODE_CFG.get("cluster_proxy") or {}
+    ip = cp.get("ip")
+    port = cp.get("port", 4000)
+    if not ip:
+        # Legacy configs without cluster_proxy: assume master runs the proxy.
+        ip = (_NODE_CFG.get("master") or {}).get("ip") or "localhost"
+    return f"http://{ip}:{port}"
+
+CLUSTER_PROXY_URL = _cluster_proxy_url()
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -483,6 +517,22 @@ def launch_instance(req: LaunchRequest):
     if _get_pid_on_port(req.port):
         raise HTTPException(status_code=409, detail=f"Port {req.port} is already in use")
 
+    # Preflight the HF repo — kills the silent gating problem. If the model isn't
+    # already cached on this node, we need to be able to pull it. If it IS cached
+    # locally, we skip the check — lookup_model requires network, and offline
+    # operation on a cached model is legitimate.
+    if req.model_id not in _cached_model_ids():
+        pf = models_hf.preflight(req.model_id)
+        if pf["status"] == "gated_unauthorized":
+            raise HTTPException(
+                status_code=403,
+                detail=f"HF access denied for '{req.model_id}'. Set an HF_TOKEN on this node with access to the repo, then retry."
+            )
+        if pf["status"] == "not_found":
+            raise HTTPException(status_code=404, detail=pf.get("message", f"Repo '{req.model_id}' not found on HuggingFace"))
+        # network_error is a soft warning — we let launch proceed; vLLM will
+        # surface the real error in its own log. `ok` means we're good.
+
     gpu_str = ",".join(str(g) for g in req.gpu_indices)
 
     flags = req.extra_flags
@@ -527,15 +577,18 @@ def launch_instance(req: LaunchRequest):
             start_new_session=True,
         )
 
-    # Register with LiteLLM if requested
+    # Register with the cluster LiteLLM proxy if requested. The proxy may be on
+    # this node (master/both) or on another node (child → master); either way,
+    # api_base must be the externally-reachable URL, never localhost, or the
+    # proxy on a different host can't reach it.
     if req.register_with_proxy:
         _http_post(
-            f"{LITELLM_URL}/model/new",
+            f"{CLUSTER_PROXY_URL}/model/new",
             {
                 "model_name": req.served_name,
                 "litellm_params": {
                     "model": f"openai/{req.served_name}",
-                    "api_base": f"http://localhost:{req.port}/v1",
+                    "api_base": f"http://{THIS_IP}:{req.port}/v1",
                     "api_key": LITELLM_KEY,
                 }
             },
@@ -580,10 +633,10 @@ def stop_instance(port: int, deregister: bool = True):
     except psutil.NoSuchProcess:
         pass
 
-    # Deregister from LiteLLM (POST /model/delete with model name in body)
+    # Deregister from the cluster LiteLLM proxy (POST /model/delete)
     if deregister and served_name:
         _http_post(
-            f"{LITELLM_URL}/model/delete",
+            f"{CLUSTER_PROXY_URL}/model/delete",
             data={"id": served_name},
             headers={"Authorization": f"Bearer {LITELLM_KEY}"},
         )
@@ -682,23 +735,117 @@ def get_cached_models():
     return sorted(list(_cached_model_ids()))
 
 
+# ── HF integration: token, preflight, cache sizes, downloads, importer ──────
+# Everything below is per-node. The dashboard composes cross-node views by
+# calling each agent in parallel (same pattern as /status).
+
+@app.get("/models/hf/token")
+def hf_token_status():
+    return models_hf.token_status()
+
+
+class HFTokenSet(BaseModel):
+    token: str
+
+
+@app.post("/models/hf/token")
+def hf_token_set(req: HFTokenSet):
+    try:
+        models_hf.write_token(req.token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return models_hf.token_status()
+
+
+@app.delete("/models/hf/token")
+def hf_token_clear():
+    models_hf.clear_token()
+    return models_hf.token_status()
+
+
+@app.get("/models/hf/lookup/{model_id:path}")
+def hf_lookup(model_id: str):
+    """Metadata + auth status for a HF repo. Powers the library importer."""
+    return models_hf.lookup_model(model_id)
+
+
+@app.get("/models/hf/preflight/{model_id:path}")
+def hf_preflight(model_id: str):
+    """
+    Called before launch to kill the silent-HF-gating problem. Returns the same
+    payload as lookup; callers should abort if status != 'ok'.
+    """
+    return models_hf.preflight(model_id)
+
+
+@app.get("/models/cache")
+def get_cache_listing():
+    """All cached models with on-disk sizes, biggest first."""
+    return models_hf.list_cached()
+
+
+@app.get("/models/cache/stats")
+def get_cache_stats():
+    """Total HF cache size + disk headroom so the UI can warn before filling up."""
+    return models_hf.cache_stats()
+
+
+@app.delete("/models/cache/{model_id:path}")
+def delete_cache(model_id: str):
+    return models_hf.delete_cached(model_id)
+
+
+class HFDownloadReq(BaseModel):
+    model_id: str
+
+
+@app.post("/models/hf/download")
+def hf_download_start(req: HFDownloadReq):
+    """
+    Kick off a pre-pull. Non-blocking — returns immediately with current state.
+    Poll /models/hf/download/{model_id} for progress.
+    """
+    state = models_hf.MANAGER.start(req.model_id)
+    return models_hf.asdict(state) if hasattr(state, "__dataclass_fields__") else state
+
+
+@app.get("/models/hf/downloads")
+def hf_downloads_list():
+    """All downloads this agent has tracked since its last start."""
+    return models_hf.MANAGER.list()
+
+
+@app.get("/models/hf/download/{model_id:path}")
+def hf_download_status(model_id: str):
+    state = models_hf.MANAGER.get(model_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="no download tracked for this model")
+    return state
+
+
+@app.delete("/models/hf/download/{model_id:path}")
+def hf_download_cancel(model_id: str):
+    ok = models_hf.MANAGER.cancel(model_id)
+    return {"canceled": ok, "model_id": model_id}
+
+
 @app.get("/proxy/status")
 def get_proxy_status():
     data = _http_get(
-        f"{LITELLM_URL}/v1/models",
+        f"{CLUSTER_PROXY_URL}/v1/models",
         headers={"Authorization": f"Bearer {LITELLM_KEY}"}
     )
     if data is None:
-        return {"healthy": False, "models": []}
+        return {"healthy": False, "models": [], "url": CLUSTER_PROXY_URL}
 
     models = [m["id"] for m in data.get("data", [])]
-    return {"healthy": True, "models": models}
+    return {"healthy": True, "models": models, "url": CLUSTER_PROXY_URL}
 
 
 @app.post("/proxy/register")
 def proxy_register(req: ProxyRegisterRequest):
     result = _http_post(
-        f"{LITELLM_URL}/model/new",
+        f"{CLUSTER_PROXY_URL}/model/new",
         {
             "model_name": req.model_name,
             "litellm_params": {
@@ -1081,8 +1228,6 @@ def agent_stop():
     return {"stopping": True}
 
 
-NODE_CONFIG_PATH = Path(__file__).parent.parent / "node_config.json"
-
 @app.get("/nodes")
 def get_nodes():
     """Return the full node list — used by child dashboards to show the whole cluster."""
@@ -1091,6 +1236,41 @@ def get_nodes():
         return config.get("nodes", [])
     except Exception:
         return []
+
+
+class RenameNodeRequest(BaseModel):
+    name: str
+    # agent_port is optional — scoping the rename to a specific (ip, port) pair
+    # disambiguates if two nodes ever shared an IP but different ports.
+    agent_port: int | None = None
+
+
+@app.patch("/nodes/{ip}")
+def rename_node(ip: str, req: RenameNodeRequest):
+    """
+    Rename a node registered in this agent's node_config.json. Intended to be
+    called on master/both — child agents have an empty nodes[] and will 404.
+    Child-served dashboards proxy through /api/nodes/rename, which forwards
+    here using the master IP from local config.
+    """
+    if not NODE_CONFIG_PATH.exists():
+        raise HTTPException(status_code=500, detail="node_config.json not found")
+    try:
+        config = json.loads(NODE_CONFIG_PATH.read_text())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"node_config.json unreadable: {e}")
+
+    nodes = config.get("nodes") or []
+    for n in nodes:
+        if n.get("ip") != ip:
+            continue
+        if req.agent_port is not None and n.get("agent_port") != req.agent_port:
+            continue
+        n["name"] = req.name
+        config["nodes"] = nodes
+        NODE_CONFIG_PATH.write_text(json.dumps(config, indent=2))
+        return {"renamed": ip, "name": req.name}
+    raise HTTPException(status_code=404, detail=f"Node {ip} not registered here")
 
 
 DASHBOARD_DIR = Path(__file__).parent.parent / "dashboard"
@@ -1175,6 +1355,79 @@ def get_full_status():
         "instances": instances,
         "proxy": proxy,
     }
+
+
+# ── Startup re-registration ───────────────────────────────────────────────────
+# When this agent (re)starts, any vLLM instances that were left running need to
+# be re-registered with the cluster proxy. Otherwise a proxy restart or a stale
+# registration from a previous boot would leave the proxy's model list out of
+# sync with what's actually serving. Runs in the background so startup doesn't
+# block on an unreachable proxy.
+
+def _reregister_existing_instances():
+    try:
+        # Let uvicorn bind first so the agent is reachable even if this blocks.
+        time.sleep(2)
+        insts = _scan_vllm_instances()
+        if not insts:
+            return
+        for inst in insts:
+            served = inst.get("served_name")
+            port   = inst.get("port")
+            if not served or not port:
+                continue
+            _http_post(
+                f"{CLUSTER_PROXY_URL}/model/new",
+                {
+                    "model_name": served,
+                    "litellm_params": {
+                        "model":    f"openai/{served}",
+                        "api_base": f"http://{THIS_IP}:{port}/v1",
+                        "api_key":  LITELLM_KEY,
+                    }
+                },
+                headers={"Authorization": f"Bearer {LITELLM_KEY}"},
+            )
+    except Exception:
+        # Best-effort — the proxy may not be up yet.
+        pass
+
+
+_SAMPLER: MetricsSampler | None = None
+
+
+@app.on_event("startup")
+def _on_startup():
+    threading.Thread(target=_reregister_existing_instances, daemon=True).start()
+
+    # Start the per-node metrics sampler. Uses the currently registered node
+    # name from node_config.json so JSONL rows are self-describing across
+    # nodes. Passing _scan_vllm_instances as the callable avoids duplicating
+    # the scan logic — the sampler sees whatever the rest of the agent sees.
+    global _SAMPLER
+    nodes_cfg = _NODE_CFG.get("nodes") or []
+    node_name = None
+    for n in nodes_cfg:
+        if n.get("ip") == THIS_IP:
+            node_name = n.get("name")
+            break
+    if not node_name:
+        node_name = THIS_IP
+    _SAMPLER = MetricsSampler(node_name=node_name, list_instances=_scan_vllm_instances)
+    _SAMPLER.start()
+
+
+@app.get("/metrics/query")
+def metrics_query(range: str = "24h", resolution: str = "1h"):
+    """
+    Returns time-bucketed aggregates for this node's GPU and per-model history.
+    Ranges: 1h, 6h, 24h, 7d, 30d. Resolutions: 1m, 5m, 15m, 1h, 6h, 1d.
+    Dashboard is expected to fetch each node in parallel and combine.
+    """
+    try:
+        return query_metrics(range_key=range, resolution_key=resolution)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"metrics query failed: {e}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
