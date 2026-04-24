@@ -33,6 +33,32 @@ Operational tasks layered on top of the running cluster. Not code features — h
 
 ---
 
+## Active Issues / UX Gaps
+
+### 🔴 Model launch feedback is opaque — "Launching…" with no progress or failure signal
+
+**Priority:** High — blocks confident operation of the cluster
+**Reported:** 2026-04-20
+**Repro:** Launch `llama-3-3-nemotron-super-49b` (fp8, 50 GB weights) on The Deathstar GPU 2 via the Deploy modal (80% memory, 32768 max context, 256 parallel slots). Modal sits on "Launching…" for a long time with no indication of what is happening. In at least one case the load silently failed and the user had no idea whether the model was still loading, stuck, or dead.
+
+**What's missing**
+- No visible stages during model load (spawning → loading weights → warming up → ready)
+- No live log tail from the vLLM subprocess in the launch modal
+- No progress indicator tied to load phase (weights into VRAM, KV cache init, server ready)
+- Silent failures — if vLLM crashes during startup, the dashboard does not surface the error or stderr
+- No timeout / "still working…" indicator when a launch is taking longer than expected
+- No cancel button once a launch has started
+
+**Acceptance criteria**
+- [ ] Launch modal shows live status: `Spawning process` → `Loading config` → `Allocating GPU memory` → `Loading weights (X%)` → `Warming up` → `Ready`
+- [ ] Live tail of vLLM stdout/stderr (last ~20 lines) in the launch modal while launching
+- [ ] Failure state surfaces the error with a stderr snippet and a "View full log" link
+- [ ] Cancel button available throughout launch; kills the spawned process and cleans up GPU allocation
+- [ ] If no stdout is observed for >30 s, UI shows `No activity for 30s — last stage: X` so user knows it is not frozen
+- [ ] After launch completes, modal auto-dismisses on success and persists on failure
+
+---
+
 ## Recently Completed
 
 - **Model Library v2 — per-node download & disk management** — every library row now shows per-node cache status with on-disk size, Download/Delete buttons, and live pre-pull progress bars polled from `/models/hf/downloads`. Top strip shows per-node disk headroom with a warning above 85% usage

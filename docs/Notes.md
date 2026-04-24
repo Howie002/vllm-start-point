@@ -1,5 +1,17 @@
 # Foundation AI Infrastructure - Notes
 
+## 2026-04-20 — Model Launch UX Bug Logged
+
+**Issue:** Launching a model from the Deploy modal shows "Launching…" with no feedback for a long time. Observed with `llama-3-3-nemotron-super-49b` (fp8, 50 GB) on Deathstar GPU 2. In one case the model failed silently — user had no way to tell if it was loading, stuck, or dead.
+
+**Logged under:** Roadmap → "Active Issues / UX Gaps" → 🔴 Model launch feedback is opaque
+
+**Why this matters:** Most model launches are multi-minute operations (loading 50GB+ weights into VRAM, initializing KV cache, vLLM warmup). Without stage-level feedback, users cannot distinguish "still working" from "hung" from "failed." This erodes confidence in the cluster.
+
+**Next steps:** Add live log tail + load-stage indicator + explicit failure surface to the Deploy modal. Full acceptance criteria captured in Roadmap.md.
+
+---
+
 ## 2026-04-20 — Repo Linked + v2 Cluster Status Catch-up
 
 **Context:** Linked Foundation AI Infrastructure project to the `vllm-start-point` repo. First sync under the new Second Brain ↔ Repo protocol. Previously flagged as "no repo" — corrected.
