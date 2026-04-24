@@ -1,6 +1,35 @@
-# Roadmap
+# Foundation AI Infrastructure — Roadmap
 
-Features planned for future development, prioritised roughly by value. Nothing here is scheduled — items get picked up as capacity allows.
+**Repo:** [github.com/Howie002/vllm-start-point](https://github.com/Howie002/vllm-start-point) (private, active on `dev`)
+**Last Synced:** 2026-04-20
+**Current Phase:** v2 Cluster — operational hardening + analytics follow-on
+**Target Production:** Ongoing operational service
+
+Living document. Software feature work in "In Progress" and phased sections below. Deployment/ops-level tasks in the first section. Nothing is scheduled — items get picked up as capacity allows.
+
+---
+
+## Active Deployment Tasks
+
+Operational tasks layered on top of the running cluster. Not code features — hardware, DNS, security.
+
+### Needs DNS / Network Access
+- [ ] Configure `aidev.txamfoundation.com` — point DNS to cluster master
+- [ ] Set up proxy host in Nginx Proxy Manager (:81) → dashboard with SSL / Let's Encrypt
+- [ ] Lock down port exposure via firewall — dashboard, proxy, agent ports should not be publicly routable
+
+### Production Hardening
+- [ ] Schedule regular VM / node snapshots for disaster recovery
+- [ ] GPU monitoring — connect analytics JSONL to a persistent dashboard (Grafana or similar)
+- [ ] Migrate SQLite → PostgreSQL when user volume grows (if applicable to dashboard state)
+
+### Z Workstation Pilot (Parallel Project)
+*See separate `HP Z Workstation Pilot` project — infrastructure listed here for cross-reference.*
+- [ ] Confirm pilot loaner delivery date and specs with HP
+- [ ] Onboard hardware — OS, NVIDIA drivers, CUDA, vLLM agent
+- [ ] Benchmark vs. DGX Sparks using the dashboard
+- [ ] Connect to Foundation Snowflake AI app as inference target
+- [ ] Purchase decision: 2× workstations, 2 cards each if validated
 
 ---
 
