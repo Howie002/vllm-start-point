@@ -42,10 +42,30 @@ export interface ProxyStatus {
   url?: string;
 }
 
+export interface UpdateStatus {
+  behind: number;
+  ahead: number;
+  dirty: boolean;
+  local_sha: string | null;
+  remote_sha: string | null;
+  branch: string;
+  repo_url: string;
+  last_checked: number | null;
+  error: string | null;
+  checking: boolean;
+}
+
+export interface UpdateConfig {
+  repo_url: string;
+  branch: string;
+  auto_pull_on_start: boolean;
+}
+
 export interface FullStatus {
   gpus: GPU[];
   instances: VLLMInstance[];
   proxy: ProxyStatus;
+  update?: UpdateStatus;
 }
 
 export interface ModelEntry {

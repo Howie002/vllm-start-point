@@ -60,7 +60,7 @@ Child nodes run their own dashboard instance too, showing the full cluster (mast
                             │
                             ▼
                ┌────────────────────────┐
-               │   Dashboard  :3000     │  ← any node (master or child)
+               │   Dashboard  :3005     │  ← any node (master or child)
                └────────────────────────┘
                     │           │
           polls each agent      │ fetches node list from master
@@ -85,7 +85,7 @@ The master agent exposes `GET /nodes` so every node can fetch the full cluster t
 
 ## Dashboard
 
-Access at `http://<any-node-ip>:3000`
+Access at `http://<any-node-ip>:3005`
 
 - **GPU Cluster** — all GPUs across all nodes in one flat grid, grouped by node badge per card. Click any card for temperature, power draw, clock, fan speed detail.
 - **Running Instances** — unified table of all vLLM instances with node, model, port, GPU, status. Click a row for context length, quantization, tensor parallel, endpoint URL.

@@ -24,19 +24,27 @@ fi
 
 cd "$SCRIPT_DIR"
 
-# Install deps if needed
-if [ ! -d "node_modules" ]; then
+# Install deps if missing, or if package-lock.json has changed since last install
+if [ ! -d "node_modules" ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then
     echo "Installing npm dependencies..."
     npm install
 fi
 
-# Build if .next doesn't exist
-if [ ! -d ".next" ]; then
+# Rebuild if .next is missing, or if any dashboard source file is newer than the
+# last build. This covers: fresh clone, git pull that touched src/, and local
+# edits — so a plain `./node.sh start` always serves the current code.
+needs_build=0
+if [ ! -f ".next/BUILD_ID" ]; then
+    needs_build=1
+elif [ -n "$(find src public next.config.mjs tailwind.config.ts postcss.config.mjs package.json -newer .next/BUILD_ID -type f 2>/dev/null | head -1)" ]; then
+    needs_build=1
+fi
+if [ "$needs_build" = "1" ]; then
     echo "Building dashboard..."
     npm run build
 fi
 
-PORT="${DASHBOARD_PORT:-3000}"
+PORT="${DASHBOARD_PORT:-3005}"
 AGENT_URL="${AGENT_URL:-http://localhost:5000}"
 echo "Starting dashboard (port $PORT)"
 

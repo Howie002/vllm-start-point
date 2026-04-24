@@ -10,8 +10,11 @@ import { ModelLibrary } from "@/components/ModelLibrary";
 import { AddNodeModal } from "@/components/AddNodeModal";
 import { PortTreeView } from "@/components/PortTreeView";
 import { AnalyticsView } from "@/components/AnalyticsView";
+import { TestingView } from "@/components/TestingView";
+import { SettingsView } from "@/components/SettingsView";
+import { UpdateBadge } from "@/components/UpdateBadge";
 
-type Tab = "overview" | "endpoints" | "analytics";
+type Tab = "overview" | "endpoints" | "analytics" | "testing" | "settings";
 
 const POLL_MS = 8000;
 
@@ -81,12 +84,15 @@ export default function Page() {
               : `${nodes.length} node${nodes.length !== 1 ? "s" : ""} configured · ${onlineCount} online`}
           </p>
         </div>
-        <button
-          onClick={() => setShowAddNode(true)}
-          className="text-xs px-3 py-1.5 rounded-lg border border-border text-slate-400 hover:text-white hover:border-slate-500 transition-colors"
-        >
-          + Add node
-        </button>
+        <div className="flex items-center gap-2">
+          <UpdateBadge nodeStatuses={nodeStatuses} onClick={() => setTab("settings")} />
+          <button
+            onClick={() => setShowAddNode(true)}
+            className="text-xs px-3 py-1.5 rounded-lg border border-border text-slate-400 hover:text-white hover:border-slate-500 transition-colors"
+          >
+            + Add node
+          </button>
+        </div>
       </div>
 
       {showAddNode && (
@@ -106,7 +112,7 @@ export default function Page() {
       {/* Tab nav */}
       {nodes.length > 0 && (
         <div className="flex items-center gap-1 border-b border-border">
-          {(["overview", "endpoints", "analytics"] as Tab[]).map(t => (
+          {(["overview", "endpoints", "analytics", "testing", "settings"] as Tab[]).map(t => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -116,7 +122,11 @@ export default function Page() {
                   : "border-transparent text-slate-500 hover:text-slate-300"
               }`}
             >
-              {t === "overview" ? "Overview" : t === "endpoints" ? "Endpoints" : "Analytics"}
+              {t === "overview" ? "Overview"
+                : t === "endpoints" ? "Endpoints"
+                : t === "analytics" ? "Analytics"
+                : t === "testing" ? "Testing"
+                : "Settings"}
             </button>
           ))}
         </div>
@@ -170,6 +180,14 @@ export default function Page() {
 
       {tab === "analytics" && nodes.length > 0 && (
         <AnalyticsView nodes={nodes} />
+      )}
+
+      {tab === "testing" && nodeStatuses.length > 0 && (
+        <TestingView nodeStatuses={nodeStatuses} />
+      )}
+
+      {tab === "settings" && nodeStatuses.length > 0 && (
+        <SettingsView nodeStatuses={nodeStatuses} onRefresh={refreshAll} />
       )}
 
     </div>

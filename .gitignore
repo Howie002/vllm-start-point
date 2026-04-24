@@ -26,6 +26,10 @@ dashboard/tsconfig.tsbuildinfo
 agent/.agent_pid
 agent/agent.log
 
+# LiteLLM proxy runtime
+litellm/.proxy_pid
+litellm/proxy.log
+
 # OS
 .DS_Store
 Thumbs.db

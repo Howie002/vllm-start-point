@@ -34,15 +34,27 @@ SCAN_PORT_MIN  = 8000
 # Must cover the range DeployModal.tsx allocates from (currently 8020–8099).
 # Previously capped at 8020, which missed every instance beyond the first.
 SCAN_PORT_MAX  = 8099
+REPO_ROOT           = Path(__file__).parent.parent
 LIBRARY_PATH        = Path(__file__).parent / "model_library.json"
-STACK_CONFIGS_PATH  = Path(__file__).parent.parent / "stack_configs.json"
-NODE_CONFIG_PATH    = Path(__file__).parent.parent / "node_config.json"
-PROXY_CONFIG_PATH   = Path(__file__).parent.parent / "litellm" / "cluster_config.yaml"
-PROXY_PID_FILE      = Path(__file__).parent.parent / "litellm" / ".proxy_pid"
-PROXY_START_SH      = Path(__file__).parent.parent / "litellm" / "start_proxy.sh"
+STACK_CONFIGS_PATH  = REPO_ROOT / "stack_configs.json"
+NODE_CONFIG_PATH    = REPO_ROOT / "node_config.json"
+PROXY_CONFIG_PATH   = REPO_ROOT / "litellm" / "cluster_config.yaml"
+PROXY_PID_FILE      = REPO_ROOT / "litellm" / ".proxy_pid"
+PROXY_START_SH      = REPO_ROOT / "litellm" / "start_proxy.sh"
 HF_CACHE            = Path.home() / ".cache" / "huggingface" / "hub"
 
-_PROXY_LOCK = threading.Lock()
+DEFAULT_REPO_URL    = "https://github.com/Howie002/vllm-start-point.git"
+DEFAULT_BRANCH      = "main"
+UPDATE_REFRESH_SEC  = 600   # 10 min
+
+_PROXY_LOCK  = threading.Lock()
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_STATUS: dict = {
+    "behind": 0, "ahead": 0, "dirty": False,
+    "local_sha": None, "remote_sha": None,
+    "branch": DEFAULT_BRANCH, "repo_url": DEFAULT_REPO_URL,
+    "last_checked": None, "error": None, "checking": False,
+}
 CUDA_ENV = {
     **os.environ,
     "PATH": f"{Path.home()}/.vllm-venv/bin:/usr/local/cuda-12.8/bin:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
@@ -1411,7 +1423,7 @@ def dashboard_restart():
     """Kill the dashboard, rebuild, and restart it."""
     def _do():
         time.sleep(0.3)
-        port = os.environ.get("DASHBOARD_PORT", "3000")
+        port = os.environ.get("DASHBOARD_PORT", "3005")
 
         # Kill by PID file first, then fall back to killing by port
         pid = _dashboard_pid()
@@ -1464,16 +1476,229 @@ def dashboard_stop():
     return {"stopped": False, "detail": "Dashboard not running"}
 
 
+# ── Self-update (git pull from the configured repo) ──────────────────────────
+# Every node can check its own git state vs origin/<branch> and pull updates.
+# Status is cached (refreshed every UPDATE_REFRESH_SEC) so /status polling is
+# cheap. /update/pull performs the fetch + ff-only merge, rebuilds the dashboard
+# if dashboard/ files changed, then re-execs the agent to pick up agent/ changes.
+
+def _load_update_config() -> dict:
+    cfg = _load_node_config()
+    upd = cfg.get("update") or {}
+    return {
+        "repo_url":           upd.get("repo_url") or DEFAULT_REPO_URL,
+        "branch":             upd.get("branch")   or DEFAULT_BRANCH,
+        "auto_pull_on_start": bool(upd.get("auto_pull_on_start", True)),
+    }
+
+
+def _save_update_config(repo_url: str, branch: str, auto_pull_on_start: bool):
+    cfg = json.loads(NODE_CONFIG_PATH.read_text())
+    cfg["update"] = {
+        "repo_url":           repo_url,
+        "branch":             branch,
+        "auto_pull_on_start": auto_pull_on_start,
+    }
+    NODE_CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def _git(*args, timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(REPO_ROOT),
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _refresh_update_status():
+    """Fetch from origin and recompute behind/ahead/dirty. Writes to cache."""
+    with _UPDATE_LOCK:
+        _UPDATE_STATUS["checking"] = True
+    try:
+        cfg = _load_update_config()
+        branch = cfg["branch"]
+        fetch = _git("fetch", "--quiet", "origin", branch, timeout=60)
+        if fetch.returncode != 0:
+            raise RuntimeError(fetch.stderr.strip() or "git fetch failed")
+        local  = _git("rev-parse", "HEAD").stdout.strip()
+        remote = _git("rev-parse", f"origin/{branch}").stdout.strip()
+        behind = int(_git("rev-list", "--count", f"HEAD..origin/{branch}").stdout.strip() or "0")
+        ahead  = int(_git("rev-list", "--count", f"origin/{branch}..HEAD").stdout.strip() or "0")
+        dirty  = bool(_git("status", "--porcelain").stdout.strip())
+        new_status = {
+            "behind": behind, "ahead": ahead, "dirty": dirty,
+            "local_sha": local[:12] if local else None,
+            "remote_sha": remote[:12] if remote else None,
+            "branch": branch, "repo_url": cfg["repo_url"],
+            "last_checked": int(time.time()), "error": None, "checking": False,
+        }
+    except Exception as e:
+        cfg = _load_update_config()
+        new_status = {
+            "behind": 0, "ahead": 0, "dirty": False,
+            "local_sha": None, "remote_sha": None,
+            "branch": cfg["branch"], "repo_url": cfg["repo_url"],
+            "last_checked": int(time.time()), "error": str(e), "checking": False,
+        }
+    with _UPDATE_LOCK:
+        _UPDATE_STATUS.update(new_status)
+
+
+def _update_refresh_loop():
+    # Initial refresh shortly after startup; subsequent every UPDATE_REFRESH_SEC.
+    time.sleep(5)
+    while True:
+        try:
+            _refresh_update_status()
+        except Exception:
+            pass
+        time.sleep(UPDATE_REFRESH_SEC)
+
+
+@app.get("/update/status")
+def update_status():
+    with _UPDATE_LOCK:
+        return dict(_UPDATE_STATUS)
+
+
+@app.post("/update/check")
+def update_check():
+    """Force a fresh git fetch + recompute. Blocks until done (≤60s)."""
+    _refresh_update_status()
+    with _UPDATE_LOCK:
+        return dict(_UPDATE_STATUS)
+
+
+@app.get("/update/config")
+def update_config_get():
+    return _load_update_config()
+
+
+class UpdateConfigRequest(BaseModel):
+    repo_url:           str
+    branch:             str
+    auto_pull_on_start: bool = True
+
+
+@app.post("/update/config")
+def update_config_set(req: UpdateConfigRequest):
+    repo_url = req.repo_url.strip()
+    branch   = req.branch.strip() or DEFAULT_BRANCH
+    if not repo_url:
+        raise HTTPException(status_code=400, detail="repo_url required")
+    _save_update_config(repo_url, branch, req.auto_pull_on_start)
+    # Also update the git remote if it differs so subsequent fetches hit the new URL
+    cur = _git("remote", "get-url", "origin").stdout.strip()
+    if cur and cur != repo_url:
+        _git("remote", "set-url", "origin", repo_url)
+    # Kick off a refresh so the UI reflects the new config
+    threading.Thread(target=_refresh_update_status, daemon=True).start()
+    return {"updated": True, "repo_url": repo_url, "branch": branch,
+            "auto_pull_on_start": req.auto_pull_on_start}
+
+
+def _post_pull_restart(dashboard_changed: bool):
+    """Background task: rebuild dashboard if needed, then re-exec the agent."""
+    time.sleep(1)  # let the HTTP response flush
+    if dashboard_changed:
+        try:
+            env = {**os.environ, "PATH": f"/usr/local/bin:/usr/bin:/bin:{os.environ.get('PATH', '')}"}
+            subprocess.run(["npm", "install"], cwd=str(DASHBOARD_DIR), env=env, timeout=600)
+            subprocess.run(["npm", "run", "build"], cwd=str(DASHBOARD_DIR), env=env, timeout=600)
+            pid = _dashboard_pid()
+            if pid:
+                try: os.kill(pid, signal.SIGTERM)
+                except Exception: pass
+            else:
+                port = os.environ.get("DASHBOARD_PORT", "3005")
+                try:
+                    result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True)
+                    for p in result.stdout.strip().split():
+                        try: os.kill(int(p), signal.SIGTERM)
+                        except Exception: pass
+                except Exception:
+                    pass
+            time.sleep(2)
+            log_file = open(DASHBOARD_DIR / "dashboard.log", "w")
+            proc = subprocess.Popen(
+                ["npm", "run", "start"],
+                cwd=str(DASHBOARD_DIR),
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+            DASHBOARD_PID_FILE.write_text(str(proc.pid))
+        except Exception:
+            pass
+    # Re-exec agent to pick up any agent/ changes (and to refresh UPDATE_STATUS).
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+@app.post("/update/pull")
+def update_pull():
+    """Run git pull --ff-only on the configured branch, then restart services."""
+    cfg = _load_update_config()
+    branch = cfg["branch"]
+
+    # Refuse if there are uncommitted changes — a pull could clobber them.
+    dirty = bool(_git("status", "--porcelain").stdout.strip())
+    if dirty:
+        raise HTTPException(status_code=409,
+            detail="Local uncommitted changes present. Commit or stash them first.")
+
+    old_sha = _git("rev-parse", "HEAD").stdout.strip()
+
+    # Make sure we're on the configured branch. Stays a no-op if already on it.
+    checkout = _git("checkout", branch)
+    if checkout.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail=f"git checkout {branch} failed: {checkout.stderr.strip()}")
+
+    pull = _git("pull", "--ff-only", "origin", branch, timeout=120)
+    if pull.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail=f"git pull failed: {pull.stderr.strip() or pull.stdout.strip()}")
+
+    new_sha = _git("rev-parse", "HEAD").stdout.strip()
+    if old_sha == new_sha:
+        # Nothing pulled — refresh status and return.
+        threading.Thread(target=_refresh_update_status, daemon=True).start()
+        return {"pulled": False, "restarting": False,
+                "detail": "Already up to date.", "sha": old_sha[:12]}
+
+    diff = _git("diff", "--name-only", f"{old_sha}..{new_sha}")
+    changed = [f for f in diff.stdout.splitlines() if f]
+    dashboard_changed = any(f.startswith("dashboard/") for f in changed)
+
+    threading.Thread(
+        target=_post_pull_restart,
+        kwargs={"dashboard_changed": dashboard_changed},
+        daemon=True,
+    ).start()
+
+    return {
+        "pulled": True,
+        "restarting": True,
+        "from": old_sha[:12],
+        "to": new_sha[:12],
+        "changed": changed,
+        "dashboard_rebuild": dashboard_changed,
+    }
+
+
 @app.get("/status")
 def get_full_status():
     """All data in a single call — used for dashboard polling."""
     gpus = get_gpus()
     instances = get_instances()
     proxy = get_proxy_status()
+    with _UPDATE_LOCK:
+        update = dict(_UPDATE_STATUS)
     return {
         "gpus": gpus,
         "instances": instances,
         "proxy": proxy,
+        "update": update,
     }
 
 
@@ -1499,6 +1724,7 @@ _SAMPLER: MetricsSampler | None = None
 @app.on_event("startup")
 def _on_startup():
     threading.Thread(target=_reregister_existing_instances, daemon=True).start()
+    threading.Thread(target=_update_refresh_loop, daemon=True).start()
 
     # Start the per-node metrics sampler. Uses the currently registered node
     # name from node_config.json so JSONL rows are self-describing across

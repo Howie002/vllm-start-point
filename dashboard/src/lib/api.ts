@@ -2,6 +2,7 @@ import type {
   FullStatus, ModelEntry, LaunchRequest, NodeConfig, StackConfig, StackModelConfig,
   PreflightResult, RepackResult, RepackAssignment, MetricsQueryResult,
   HFTokenStatus, HFLookup, CachedModel, CacheStats, DownloadState,
+  UpdateStatus, UpdateConfig,
 } from "./types";
 
 // Build a direct URL to a node's agent (browser calls this cross-origin)
@@ -77,6 +78,13 @@ export function createNodeApi(node: NodeConfig) {
     hfDownloadStatus: (model_id: string)     => get<DownloadState> (base, `/models/hf/download/${encodeURIComponent(model_id)}`),
     hfDownloadCancel: (model_id: string)     => del<{ canceled: boolean }>(base, `/models/hf/download/${encodeURIComponent(model_id)}`),
     hfDownloads:      ()                     => get<DownloadState[]>(base, "/models/hf/downloads"),
+
+    // Self-update — per node git state vs origin/<branch>
+    updateStatus:     ()                               => get<UpdateStatus>  (base, "/update/status"),
+    updateCheck:      ()                               => post<UpdateStatus> (base, "/update/check", {}),
+    updatePull:       ()                               => post<{ pulled: boolean; restarting: boolean; from?: string; to?: string; changed?: string[]; detail?: string }>(base, "/update/pull", {}),
+    updateConfigGet:  ()                               => get<UpdateConfig>  (base, "/update/config"),
+    updateConfigSet:  (repo_url: string, branch: string, auto_pull_on_start: boolean) => post<{ updated: boolean; repo_url: string; branch: string; auto_pull_on_start: boolean }>(base, "/update/config", { repo_url, branch, auto_pull_on_start }),
   };
 }
 

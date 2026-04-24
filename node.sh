@@ -90,14 +90,18 @@ cfg = {
     "master": {
         "ip":             master_ip,
         "agent_port":     int(os.environ.get("CFG_MASTER_AGENT_PORT", "5000")),
-        "dashboard_port": int(os.environ["CFG_DASH_PORT"])
     },
     "cluster_proxy": {
         "ip":   proxy_ip,
         "port": proxy_port,
     },
     "agent_port": int(os.environ["CFG_AGENT_PORT"]),
-    "nodes":      json.loads(os.environ.get("CFG_NODES", "[]"))
+    "nodes":      json.loads(os.environ.get("CFG_NODES", "[]")),
+    "update": {
+        "repo_url":           os.environ.get("CFG_REPO_URL", "https://github.com/Howie002/vllm-start-point.git"),
+        "branch":             os.environ.get("CFG_REPO_BRANCH", "main"),
+        "auto_pull_on_start": os.environ.get("CFG_REPO_AUTO_PULL", "true").lower() == "true",
+    },
 }
 json.dump(cfg, open(sys.argv[1], "w"), indent=2)
 print(json.dumps(cfg, indent=2))
@@ -281,12 +285,6 @@ do_setup() {
         agent_port="${agent_port:-5000}"
     fi
 
-    local dashboard_port="3000"
-    if [ "$role" != "child" ] && [ -z "$_noninteractive" ]; then
-        read -rp "Dashboard port [3000]: " dashboard_port
-        dashboard_port="${dashboard_port:-3000}"
-    fi
-
     # ── Child nodes ───────────────────────────────────────────────────────────
     local nodes_json="[]"
     if [ "$role" != "child" ]; then
@@ -345,7 +343,6 @@ PY
     CFG_THIS_IP="$this_ip" \
     CFG_MASTER_IP="$master_ip" \
     CFG_MASTER_AGENT_PORT="${VLLM_MASTER_AGENT_PORT:-5000}" \
-    CFG_DASH_PORT="$dashboard_port" \
     CFG_AGENT_PORT="$agent_port" \
     CFG_NODES="$nodes_json" \
     write_config || bail "Failed to write config file."
@@ -509,18 +506,79 @@ do_add_node() {
     _CLEAN_EXIT=true
 }
 
+# Pre-start auto-update: fetch from configured git remote, fast-forward pull if
+# behind & clean, rebuild dashboard if dashboard/ changed. Never fatal — any
+# failure downgrades to a warning and services start with the current checkout.
+try_auto_pull() {
+    [ ! -d "$SCRIPT_DIR/.git" ] && return 0
+
+    local auto branch
+    auto=$(cfg_get "['update'].get('auto_pull_on_start', True)" "True")
+    [ "$auto" != "True" ] && return 0
+    branch=$(cfg_get "['update'].get('branch', 'main')" "main")
+
+    # Dirty working tree → skip (a pull could clobber user edits)
+    if ! git -C "$SCRIPT_DIR" diff --quiet 2>/dev/null || \
+       ! git -C "$SCRIPT_DIR" diff --cached --quiet 2>/dev/null; then
+        warn "Skipping auto-update: local uncommitted changes in working tree"
+        return 0
+    fi
+
+    info "Checking for updates on origin/$branch..."
+    if ! timeout 15 git -C "$SCRIPT_DIR" fetch --quiet origin "$branch" 2>/dev/null; then
+        warn "Update check failed (network or auth) — continuing with current version"
+        return 0
+    fi
+
+    local old_sha new_sha
+    old_sha=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
+    local remote_sha
+    remote_sha=$(git -C "$SCRIPT_DIR" rev-parse "origin/$branch" 2>/dev/null)
+    if [ "$old_sha" = "$remote_sha" ]; then
+        info "Already up to date (${old_sha:0:12})"
+        return 0
+    fi
+
+    # Only fast-forward. If local has diverged, bail — user must resolve manually.
+    if ! git -C "$SCRIPT_DIR" merge-base --is-ancestor HEAD "origin/$branch" 2>/dev/null; then
+        warn "Cannot fast-forward: local has diverged from origin/$branch. Resolve manually."
+        return 0
+    fi
+
+    if ! git -C "$SCRIPT_DIR" pull --ff-only --quiet origin "$branch" 2>/dev/null; then
+        warn "git pull failed — continuing with current version"
+        return 0
+    fi
+
+    new_sha=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
+    success "Updated ${old_sha:0:12} → ${new_sha:0:12}"
+
+    # Rebuild dashboard if dashboard/ files changed — otherwise next.js serves stale JS
+    if git -C "$SCRIPT_DIR" diff --name-only "$old_sha" "$new_sha" | grep -q '^dashboard/'; then
+        info "Dashboard files changed — rebuilding..."
+        (
+            cd "$SCRIPT_DIR/dashboard" && \
+            npm install --silent >/dev/null 2>&1 && \
+            npm run build >/dev/null 2>&1
+        ) && success "Dashboard rebuilt." \
+          || warn "Dashboard rebuild failed — start will use previous build"
+    fi
+}
+
 # ── Start ─────────────────────────────────────────────────────────────────────
 do_start() {
     [ ! -f "$CONFIG_FILE" ] && bail "No config found. Run './node.sh setup' first."
 
-    local role agent_port master_ip dashboard_port this_ip
+    local role agent_port master_ip this_ip
     role=$(cfg_get "['role']" "both")
     agent_port=$(cfg_get ".get('agent_port', 5000)" "5000")
     master_ip=$(cfg_get "['master']['ip']" "localhost")
-    dashboard_port=$(cfg_get "['master']['dashboard_port']" "3000")
     this_ip=$(cfg_get ".get('this_ip', 'localhost')" "localhost")
+    local dashboard_port="3005"
 
     header "Starting services (role: $role)"
+
+    try_auto_pull
 
     if [ "$role" = "child" ] || [ "$role" = "both" ]; then
         info "Starting control agent (port $agent_port)..."
@@ -588,7 +646,7 @@ do_status() {
 
     if [ "$role" != "child" ]; then
         local dp
-        dp=$(cfg_get "['master']['dashboard_port']" "3000")
+        local dp="3005"
         if curl -sf --connect-timeout 3 "http://localhost:$dp" &>/dev/null; then
             success "Dashboard  :$dp  UP"
         else

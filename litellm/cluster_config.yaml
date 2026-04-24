@@ -10,12 +10,7 @@ model_list:
   - model_name: llama-3-1-nemotron-nano-8b-v1
     litellm_params:
       model: openai/llama-3-1-nemotron-nano-8b-v1
-      api_base: http://10.2.30.28:8021/v1
-      api_key: none
-  - model_name: llama-3-1-nemotron-nano-8b-v1
-    litellm_params:
-      model: openai/llama-3-1-nemotron-nano-8b-v1
-      api_base: http://10.2.30.28:8025/v1
+      api_base: http://10.2.30.32:8022/v1
       api_key: none
 
 router_settings:

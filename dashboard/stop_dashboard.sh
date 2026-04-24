@@ -16,7 +16,8 @@ else
     rm -f "$PID_FILE"
 fi
 
-LEFTOVER=$(lsof -ti:3000 2>/dev/null)
+PORT="${DASHBOARD_PORT:-3005}"
+LEFTOVER=$(lsof -ti:"$PORT" 2>/dev/null)
 if [ -n "$LEFTOVER" ]; then
-    kill $LEFTOVER 2>/dev/null && echo "Killed leftover process on port 3000"
+    kill $LEFTOVER 2>/dev/null && echo "Killed leftover process on port $PORT"
 fi
