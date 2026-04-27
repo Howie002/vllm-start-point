@@ -1,5 +1,18 @@
 # Foundation AI Infrastructure - Notes
 
+## 2026-04-27 — Merged HP Z Workstation Pilot into this project
+
+The standalone "HP Z Workstation Pilot" project was redundant — the Z Workstation work is part of Foundation AI Infrastructure's hardware fleet evaluation, not a separate project. Merged the pilot's content into this project's Overview.md as a new "HP Z Workstation Pilot Detail" section, preserving all the original spec / purchase plan / role information.
+
+**Changes:**
+- Folder `0. Active Priority/HP Z Workstation Pilot/` deleted (content fully migrated)
+- New section in this project's Overview.md captures pilot hardware specs, purchase plan, why this hardware matters, role in v2 cluster, contacts
+- "Related Projects" link to the standalone HP Z Workstation Pilot folder removed (folder no longer exists)
+
+Pilot status unchanged: TENTATIVE — awaiting hardware arrival. RTX Pro 6000 Blackwell cards are the candidate. If validated, plan is 2× workstations with 2 cards each.
+
+---
+
 ## 2026-04-20 — Model Launch UX Bug Logged
 
 **Issue:** Launching a model from the Deploy modal shows "Launching…" with no feedback for a long time. Observed with `llama-3-3-nemotron-super-49b` (fp8, 50 GB) on Deathstar GPU 2. In one case the model failed silently — user had no way to tell if it was loading, stuck, or dead.

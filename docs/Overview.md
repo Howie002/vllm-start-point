@@ -13,7 +13,7 @@ Enduring project tracking the build-out, migration, maintenance, and evolution o
 ## Status
 **Current Phase:** v2 Cluster — Operational Hardening + Analytics Follow-on
 **Started:** 2025
-**Last Updated:** 2026-04-20
+**Last Updated:** 2026-04-27
 
 ## Current Architecture (v2)
 
@@ -55,9 +55,48 @@ GPU load dashboards, uptime monitoring, cost tracking, snapshot cadence, model m
 
 ## Related Projects
 - [Foundation Snowflake AI](../Foundation Snowflake AI/Overview.md) — first major workload targeting Z Workstation
-- [HP Z Workstation Pilot](../HP Z Workstation Pilot/Overview.md) — parallel hardware pilot
 - [Foundation Chat](../Foundation Chat/Overview.md) — primary app service running on infrastructure
-- [Foundation Way Coach](../Foundation Way Coach/Overview.md) — primary app service running on infrastructure
+- *Foundation Way Coach — archived 2026-04-20*
+- *HP Z Workstation Pilot — merged into this project's Hardware section (2026-04-27); standalone folder removed*
+
+---
+
+## HP Z Workstation Pilot Detail
+*(Merged from the standalone "HP Z Workstation Pilot" project on 2026-04-27. The pilot is part of Foundation AI Infrastructure's hardware fleet evaluation, not a separate project.)*
+
+### Pilot Hardware
+| Component | Detail |
+|-----------|--------|
+| **Device** | HP Z Workstation (model TBD) |
+| **GPUs** | 4× NVIDIA RTX Pro 6000 Blackwell |
+| **GPU Memory** | TBD (specs pending hardware arrival) |
+| **System RAM** | TBD |
+| **Storage** | TBD |
+| **Status** | TENTATIVE — Pilot Loaner |
+
+> Update specs once hardware arrives.
+
+### Purchase Plan (If Validated)
+- **Units:** 2× HP Z Workstations
+- **GPUs per unit:** 2× NVIDIA RTX Pro 6000 Blackwell
+- **Rationale:** Distributed across two machines for redundancy; expandable to 4 cards per machine if needed
+- **Role:** Replace or supplement DGX Sparks for high-demand inference workloads
+
+### Why This Hardware Matters
+RTX Pro 6000 Blackwell cards provide substantially more GPU memory than the DGX Spark GB10 nodes, enabling:
+- Larger models (higher parameter counts) without quantization tradeoffs
+- Batch processing workloads (e.g., AI extraction across entire Snowflake tables)
+- Multi-GPU inference for very large models (if NVLink supported)
+- Potential for fine-tuning smaller models on Foundation data
+
+### Pilot Role in v2 Cluster
+**Current pilot role:** standalone inference node for Snowflake AI app testing. Connects directly to the Streamlit app during testing — not yet registered with the vLLM dashboard / LiteLLM proxy.
+
+**Future role (if purchased):** two workstations join the cluster via the vLLM dashboard, alongside or replacing DGX Sparks based on benchmark results.
+
+### Pilot Contacts
+- **Andrew Howerton** — Project Lead
+- HP representative (pilot coordination) — TBD
 
 ## Future Considerations
 - **ZGX Furry** — 750GB+ unified memory, 1T parameter models, training/fine-tuning capability
@@ -69,4 +108,4 @@ GPU load dashboards, uptime monitoring, cost tracking, snapshot cadence, model m
 
 **Filed Under:** Work Projects > Active Priority
 **Created:** 2026-03-05
-**Last Updated:** 2026-04-20
+**Last Updated:** 2026-04-27
