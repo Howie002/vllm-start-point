@@ -215,3 +215,13 @@ Small or uncertain items that may not be worth building but are worth rememberin
 - Export utilization data to Grafana via a Prometheus scrape endpoint on the agent
 - Per-node resource reservations — prevent the stack from filling a GPU that's allocated to LM Studio or another tool
 - Model family grouping in the deploy modal — show all quantization variants of a base model together
+
+---
+
+## Cross-cutting: In-tool Feedback Widget
+
+- [ ] When the Foundation AI Dashboard ships its in-tool feedback widget, drop the shared component into this tool's UI (vLLM Dashboard surface — for IT operators to give feedback on cluster management UX). Per-tool work = thin embed; the shared widget, API, GitHub Issue routing, and central aggregation view are built once in the Foundation AI Dashboard. **Canonical source of truth (design / architecture / acceptance criteria):** [Foundation AI Dashboard → Phase 7](../Foundation%20AI%20Dashboard/Roadmap.md).
+
+---
+
+**Last Updated:** 2026-04-28
