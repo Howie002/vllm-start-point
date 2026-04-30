@@ -187,6 +187,14 @@ Push events (model healthy, model crashed, GPU OOM, scale-up triggered) to a con
 
 ## Phase 6 — Infrastructure
 
+**DNS-based node discovery for faster onboarding** *(from 2026-04-29 conversation with Cody)*
+Today onboarding a master or child node requires the operator to know and type the target IP, which slows things down and creates room for typos. Replace (or augment) the IP-entry step with a DNS-driven discovery flow:
+- **DNS lookup mode** — operator types a hostname; setup resolves it via DNS and uses the resulting IP. Removes the "what IP did Cody assign that box again?" friction.
+- **Range-scan mode** — setup scans a configured network range (e.g. `10.2.30.0/24` for the AI subnet), reverse-resolves each responding host, and produces a picklist of DNS names. Operator chooses from the list instead of remembering hostnames.
+- The picklist also surfaces nodes that are reachable but not yet registered with this cluster — useful for catching forgotten boxes or planning expansion.
+- Pairs naturally with the device-profile presets below: pick the host from the DNS list, pick the device profile, setup proceeds.
+- Configurable: `node.sh` setup gains `DNS_SEARCH_DOMAIN` and `NODE_DISCOVERY_RANGE` env vars or `node_config.json` fields; falls back to manual IP entry if discovery is disabled.
+
 **Device-profile setup presets**
 Today `node.sh setup` asks generic questions (role, IP, port) and a single aarch64-vs-x86_64 switch picks wheels. Real deployments tend to be a handful of well-known platforms — DGX Spark (GB10), HP Z8 Linux + RTX PRO 6000 Blackwell, Jetson, generic x86_64 + consumer RTX, etc. Add a device-type picker to the setup flow that expands into a preset: correct wheel index (cu130 nightly vs cu128 stable), torch pin, vLLM channel (pre vs stable), default GPU layout in `stack_configs.json`, expected SM/compute-cap warnings, and any platform-specific quirks (unified memory, NVLink topology, MIG). A profile registry (`setup_profiles/*.yaml` or similar) keeps the logic out of the shell script and makes new hardware trivial to onboard — add a profile, pick it at setup.
 
