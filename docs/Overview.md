@@ -1,7 +1,7 @@
-# Foundation AI Infrastructure
+# AI Distributed Inference Cluster
 
 ## Repository
-- **Repo:** [github.com/Howie002/vllm-start-point](https://github.com/Howie002/vllm-start-point) (private)
+- **Repo:** [github.com/Howie002/AI-Distributed-Inference-Cluster](https://github.com/Howie002/AI-Distributed-Inference-Cluster) (private)
 - **Branches:** `main` stable, `dev` active (currently equal)
 - **Docs synced to:** `repo/docs/`
 - **Roadmap:** `repo/ROADMAP.md` (mirrors `Roadmap.md` in this folder)
@@ -17,7 +17,7 @@ Enduring project tracking the build-out, migration, maintenance, and evolution o
 
 ## Current Architecture (v2)
 
-Multi-node GPU cluster managed via the vLLM Dashboard (`vllm-start-point` repo). Cluster includes master + child nodes, unified GPU view, LiteLLM proxy for model serving, and per-node analytics. DGX Spark unified memory (GB10) fully supported; cross-node deployment works via dashboard. Previous architecture used Docker Compose on a single VM with Nginx-round-robin to Ollama nodes — that pattern has been superseded by the dashboard-managed cluster.
+Multi-node GPU cluster managed via the cluster dashboard (`AI-Distributed-Inference-Cluster` repo, formerly `vllm-start-point`). Cluster includes master + child nodes, unified GPU view, LiteLLM proxy for model serving, and per-node analytics. DGX Spark unified memory (GB10) fully supported; cross-node deployment works via dashboard. Previous architecture used Docker Compose on a single VM with Nginx-round-robin to Ollama nodes — that pattern has been superseded by the dashboard-managed cluster.
 
 **Reference:** See [Foundation-AI-Architecture.md](../../Foundation-AI-Architecture.md) for full architecture diagram, network topology, and port map.
 
@@ -62,7 +62,7 @@ GPU load dashboards, uptime monitoring, cost tracking, snapshot cadence, model m
 ---
 
 ## HP Z Workstation Pilot Detail
-*(Merged from the standalone "HP Z Workstation Pilot" project on 2026-04-27. The pilot is part of Foundation AI Infrastructure's hardware fleet evaluation, not a separate project.)*
+*(Merged from the standalone "HP Z Workstation Pilot" project on 2026-04-27. The pilot is part of this project's hardware fleet evaluation, not a separate project.)*
 
 ### Pilot Hardware
 | Component | Detail |

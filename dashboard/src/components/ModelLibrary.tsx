@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import type {
   ModelEntry, ClusterNodeStatus, ClusterGPU, VLLMInstance, NodeConfig,
-  CachedModel, CacheStats, DownloadState,
+  CachedModel, CacheStats, DownloadState, PendingLaunch,
 } from "@/lib/types";
 import { createNodeApi } from "@/lib/api";
 import { DeployModal } from "./DeployModal";
@@ -30,13 +30,17 @@ interface Props {
   masterNode: NodeConfig;
   onRefresh: () => void;
   onLibraryChanged: () => void;
+  // Fires from DeployModal the instant a launch returns successfully so the
+  // top-level pending-launch list can render a "Loading…" banner on the
+  // targeted GPUs before the next /status poll surfaces the new instance.
+  onLaunchStart: (p: PendingLaunch) => void;
 }
 
 // Keyed per (node.ip:agent_port) — used to pivot cache info by node.
 function nodeKey(n: NodeConfig): string { return `${n.ip}:${n.agent_port}`; }
 
 
-export function ModelLibrary({ models, nodeStatuses, masterNode, onRefresh, onLibraryChanged }: Props) {
+export function ModelLibrary({ models, nodeStatuses, masterNode, onRefresh, onLibraryChanged, onLaunchStart }: Props) {
   const [family, setFamily]         = useState("all");
   const [typeFilter, setTypeFilter] = useState("all");
   const [deploying, setDeploying]   = useState<ModelEntry | null>(null);
@@ -52,7 +56,23 @@ export function ModelLibrary({ models, nodeStatuses, masterNode, onRefresh, onLi
   // Track which nodes we've queried; used so we know what to render even when cached list is empty
   const [nodeErrors, setNodeErrors] = useState<Record<string, string>>({});
 
-  const onlineNodes = nodeStatuses.filter(ns => !!ns.status).map(ns => ns.node);
+  // The parent re-renders us every status poll tick, which gives us a fresh
+  // `nodeStatuses` array reference. Deriving onlineNodes inline would then
+  // produce a fresh array each render and invalidate every downstream
+  // useCallback / useEffect — including the cache and download poll
+  // intervals below, which would tear down and recreate on every tick.
+  // Memoize against a stable signature of the *online set* so the polling
+  // intervals only restart when a node actually comes online or goes offline.
+  const onlineKey = nodeStatuses
+    .filter(ns => !!ns.status)
+    .map(ns => `${ns.node.ip}:${ns.node.agent_port}`)
+    .sort()
+    .join(",");
+  const onlineNodes = useMemo(
+    () => nodeStatuses.filter(ns => !!ns.status).map(ns => ns.node),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [onlineKey],
+  );
   // Master online? Some UI surfaces (Import, Manage) only work when the
   // authority is reachable. Tokens are per-node and stay available regardless.
   const masterOnline = !!nodeStatuses.find(
@@ -338,6 +358,7 @@ export function ModelLibrary({ models, nodeStatuses, masterNode, onRefresh, onLi
           allInstances={allInstances}
           onClose={() => setDeploying(null)}
           onLaunched={() => { setDeploying(null); onRefresh(); }}
+          onLaunchStart={onLaunchStart}
         />
       )}
 

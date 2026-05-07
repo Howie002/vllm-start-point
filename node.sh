@@ -1,5 +1,5 @@
 #!/bin/bash
-# node.sh — vLLM Stack Node Manager
+# node.sh — AI Distributed Inference Cluster Node Manager
 # Usage:
 #   ./node.sh            — interactive menu (first run = full setup)
 #   ./node.sh start      — start services for this node's role
@@ -98,7 +98,7 @@ cfg = {
     "agent_port": int(os.environ["CFG_AGENT_PORT"]),
     "nodes":      json.loads(os.environ.get("CFG_NODES", "[]")),
     "update": {
-        "repo_url":           os.environ.get("CFG_REPO_URL", "https://github.com/Howie002/vllm-start-point.git"),
+        "repo_url":           os.environ.get("CFG_REPO_URL", "https://github.com/Howie002/AI-Distributed-Inference-Cluster.git"),
         "branch":             os.environ.get("CFG_REPO_BRANCH", "main"),
         "auto_pull_on_start": os.environ.get("CFG_REPO_AUTO_PULL", "true").lower() == "true",
     },
@@ -219,7 +219,7 @@ do_setup() {
 
     if [ -z "$_noninteractive" ]; then
         echo -e "\n${BOLD}╔═══════════════════════════════════════╗${RESET}"
-        echo -e "${BOLD}║   vLLM Stack — Node Setup              ║${RESET}"
+        echo -e "${BOLD}║   AI Distributed Inference Cluster     ║${RESET}"
         echo -e "${BOLD}╚═══════════════════════════════════════╝${RESET}\n"
 
         if [ -f "$CONFIG_FILE" ]; then

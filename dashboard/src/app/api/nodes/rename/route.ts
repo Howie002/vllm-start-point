@@ -1,6 +1,14 @@
 import { NextResponse } from "next/server";
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, renameSync } from "fs";
 import { join } from "path";
+
+// Write JSON atomically: tmp file in the same directory, then rename. Prevents
+// a crashed/interrupted handler from leaving node_config.json half-written.
+function writeJsonAtomic(path: string, data: unknown): void {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2));
+  renameSync(tmp, path);
+}
 
 export const dynamic = "force-dynamic";
 
@@ -46,7 +54,7 @@ export async function POST(req: Request) {
       // We own the canonical list — update in place.
       localMatch.name = name;
       config.nodes = localNodes;
-      writeFileSync(configPath, JSON.stringify(config, null, 2));
+      writeJsonAtomic(configPath, config);
       return NextResponse.json({ renamed: ip, name });
     }
 
@@ -57,11 +65,21 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "No master IP configured — cannot proxy rename" }, { status: 500 });
     }
 
-    const res = await fetch(`http://${masterIp}:${masterAgentPort}/nodes/${encodeURIComponent(ip)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, agent_port }),
-    });
+    // Hard timeout so an unreachable master can't tie up this route handler.
+    let res: Response;
+    try {
+      res = await fetch(`http://${masterIp}:${masterAgentPort}/nodes/${encodeURIComponent(ip)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, agent_port }),
+        signal: AbortSignal.timeout(8000),
+      });
+    } catch (e) {
+      return NextResponse.json(
+        { error: `Could not reach master agent at ${masterIp}:${masterAgentPort} — ${String(e)}` },
+        { status: 504 },
+      );
+    }
     if (!res.ok) {
       const detail = await res.text();
       return NextResponse.json({ error: detail || `master agent → ${res.status}` }, { status: res.status });

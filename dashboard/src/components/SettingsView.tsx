@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import type { ClusterNodeStatus, NodeConfig, UpdateStatus } from "@/lib/types";
 import { createNodeApi } from "@/lib/api";
 
@@ -128,8 +128,6 @@ export function SettingsView({ nodeStatuses, onRefresh }: Props) {
       setSavingKey(null);
     }
   };
-
-  useEffect(() => { /* no-op for now */ }, []);
 
   const anyCanUpdate = nodeStatuses.some(ns => {
     const u = ns.status?.update;

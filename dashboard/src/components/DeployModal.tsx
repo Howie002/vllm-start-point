@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import type { ModelEntry, VLLMInstance, ClusterGPU } from "@/lib/types";
+import type { ModelEntry, VLLMInstance, ClusterGPU, PendingLaunch } from "@/lib/types";
 import { createNodeApi } from "@/lib/api";
 
 interface Props {
@@ -10,6 +10,11 @@ interface Props {
   allInstances: VLLMInstance[];
   onClose: () => void;
   onLaunched: () => void;
+  // Fire-and-forget hook the modal calls the moment a launch returns
+  // successfully. Lets the dashboard render an optimistic "Loading…" banner
+  // on the targeted GPUs immediately, instead of waiting for the next
+  // /status poll (up to 15s away) to surface the new vLLM process.
+  onLaunchStart: (p: PendingLaunch) => void;
 }
 
 function nextPort(instances: VLLMInstance[]) {
@@ -46,7 +51,7 @@ function vramBreakdown(
   return { totalGB, reservedGB, weightsGB, kvPoolGB, freeGB, seqKvGB, concurrentSeqs, overLimit: weightsGB > reservedGB };
 }
 
-export function DeployModal({ model, clusterGpus, allInstances, onClose, onLaunched }: Props) {
+export function DeployModal({ model, clusterGpus, allInstances, onClose, onLaunched, onLaunchStart }: Props) {
   const [selectedGpus, setSelectedGpus] = useState<ClusterGPU[]>(
     clusterGpus.length > 0 ? [clusterGpus[0]] : []
   );
@@ -105,6 +110,15 @@ export function DeployModal({ model, clusterGpus, allInstances, onClose, onLaunc
         port, served_name: servedName,
         register_with_proxy: registerProxy,
         extra_flags: extraFlags,
+      });
+      onLaunchStart({
+        nodeIp: targetNode.ip,
+        nodeAgentPort: targetNode.agent_port,
+        gpuIndices: selectedGpus.map(cg => cg.gpu.index),
+        modelId: model.id,
+        modelName: model.name,
+        servedName,
+        startedAt: Date.now(),
       });
       onLaunched(); onClose();
     } catch (e) {

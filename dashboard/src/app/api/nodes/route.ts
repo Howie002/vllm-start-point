@@ -23,12 +23,17 @@ export async function GET() {
       const masterAgentPort = config.master?.agent_port ?? 5000;
       if (masterIp) {
         try {
-          const res = await fetch(`http://${masterIp}:${masterAgentPort}/nodes`, { cache: "no-store" });
+          // Hard cap so an unreachable master doesn't tie up the route
+          // handler (and by extension the child dashboard's poll loop).
+          const res = await fetch(`http://${masterIp}:${masterAgentPort}/nodes`, {
+            cache: "no-store",
+            signal: AbortSignal.timeout(5000),
+          });
           if (res.ok) {
             return NextResponse.json(await res.json());
           }
         } catch {
-          // Master unreachable — fall through to local config
+          // Master unreachable / timed out — fall through to local config
         }
       }
     }

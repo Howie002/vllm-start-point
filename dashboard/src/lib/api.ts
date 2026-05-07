@@ -2,7 +2,7 @@ import type {
   FullStatus, ModelEntry, LaunchRequest, NodeConfig, StackConfig, StackModelConfig,
   PreflightResult, RepackResult, RepackAssignment, MetricsQueryResult,
   HFTokenStatus, HFLookup, CachedModel, CacheStats, DownloadState,
-  UpdateStatus, UpdateConfig,
+  UpdateStatus, UpdateConfig, DynamicLog,
 } from "./types";
 
 // Build a direct URL to a node's agent (browser calls this cross-origin)
@@ -14,17 +14,30 @@ function agentBase(node: NodeConfig): string {
   return `http://${node.ip}:${node.agent_port}`;
 }
 
-async function get<T>(base: string, path: string): Promise<T> {
-  const res = await fetch(`${base}${path}`, { cache: "no-store" });
+// Default timeouts in ms. Polling fans out to every configured node every few
+// seconds; without a hard cap, a single dead node holds requests open for the
+// browser's default TCP timeout (~90s on Firefox), which piles up faster than
+// they retire and freezes the tab. GET is bounded tighter than POST/DELETE
+// because reads are auto-fired on a schedule while writes are user-initiated.
+const DEFAULT_GET_TIMEOUT_MS  = 6000;
+const DEFAULT_POST_TIMEOUT_MS = 30000;
+const DEFAULT_DEL_TIMEOUT_MS  = 30000;
+
+async function get<T>(base: string, path: string, timeoutMs = DEFAULT_GET_TIMEOUT_MS): Promise<T> {
+  const res = await fetch(`${base}${path}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
   return res.json();
 }
 
-async function post<T>(base: string, path: string, body: unknown): Promise<T> {
+async function post<T>(base: string, path: string, body: unknown, timeoutMs = DEFAULT_POST_TIMEOUT_MS): Promise<T> {
   const res = await fetch(`${base}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const detail = await res.text();
@@ -33,8 +46,11 @@ async function post<T>(base: string, path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
-async function del<T>(base: string, path: string): Promise<T> {
-  const res = await fetch(`${base}${path}`, { method: "DELETE" });
+async function del<T>(base: string, path: string, timeoutMs = DEFAULT_DEL_TIMEOUT_MS): Promise<T> {
+  const res = await fetch(`${base}${path}`, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   if (!res.ok) throw new Error(`DELETE ${path} → ${res.status}`);
   return res.json();
 }
@@ -65,6 +81,11 @@ export function createNodeApi(node: NodeConfig) {
     deleteModel:          (id: string)                             => del<{ deleted: string }>     (base, `/models/library/${encodeURIComponent(id)}`),
     metrics:              (range: string, resolution: string)      => get<MetricsQueryResult>      (base, `/metrics/query?range=${range}&resolution=${resolution}`),
 
+    // Tail of the per-instance vLLM log captured during launch. Used to
+    // diagnose silent crashes — vLLM dies during init, dashboard never sees
+    // a healthy instance, and the only evidence is in this file.
+    dynamicLog:           (port: number, tail = 200)                => get<DynamicLog>             (base, `/logs/dynamic/${port}?tail=${tail}`),
+
     // HF integration — per node
     hfTokenStatus:   ()                      => get<HFTokenStatus> (base, "/models/hf/token"),
     hfTokenSet:      (token: string)         => post<HFTokenStatus>(base, "/models/hf/token", { token }),
@@ -90,9 +111,16 @@ export function createNodeApi(node: NodeConfig) {
 
 // Fetch the node list from the server-side config
 export async function fetchNodes(): Promise<NodeConfig[]> {
-  const res = await fetch("/api/nodes", { cache: "no-store" });
-  if (!res.ok) return [{ name: "Local", ip: "localhost", agent_port: 5000 }];
-  return res.json();
+  try {
+    const res = await fetch("/api/nodes", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return [{ name: "Local", ip: "localhost", agent_port: 5000 }];
+    return res.json();
+  } catch {
+    return [{ name: "Local", ip: "localhost", agent_port: 5000 }];
+  }
 }
 
 // Identify the master node from a list of nodes + their statuses. The master
@@ -126,5 +154,25 @@ export async function renameNode(ip: string, agent_port: number, name: string): 
   if (!res.ok) {
     const detail = await res.text();
     throw new Error(detail || `rename → ${res.status}`);
+  }
+}
+
+// Update a registered node's name, IP, and / or agent port. Same topology as
+// renameNode — Next.js routes the change to the master's node_config.json.
+export async function editNode(args: {
+  ip: string;
+  agent_port: number;
+  name: string;
+  new_ip: string;
+  new_agent_port: number;
+}): Promise<void> {
+  const res = await fetch("/api/nodes/edit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(args),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(detail || `edit → ${res.status}`);
   }
 }

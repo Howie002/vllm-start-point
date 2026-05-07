@@ -1,6 +1,14 @@
 import { NextResponse } from "next/server";
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, renameSync } from "fs";
 import { join } from "path";
+
+// Write JSON atomically: tmp file in the same directory, then rename. Prevents
+// a crashed/interrupted handler from leaving node_config.json half-written.
+function writeJsonAtomic(path: string, data: unknown): void {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2));
+  renameSync(tmp, path);
+}
 
 export const dynamic = "force-dynamic";
 
@@ -67,7 +75,7 @@ export async function POST(req: Request) {
     }
 
     config.nodes = nodes;
-    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    writeJsonAtomic(configPath, config);
 
     return NextResponse.json({ added: { name, ip, agent_port }, setup_cmd: setupCmd });
   } catch (e) {

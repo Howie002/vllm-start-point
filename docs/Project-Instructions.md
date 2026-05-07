@@ -1,10 +1,10 @@
-# Foundation AI Infrastructure — Project Instructions
+# AI Distributed Inference Cluster — Project Instructions
 
 ## What This Project Is
-Enduring infrastructure project tracking the build-out, migration, maintenance, and evolution of Foundation's on-premises AI infrastructure — VM environment, DGX Spark nodes, and supporting services.
+Enduring infrastructure project tracking the build-out, migration, maintenance, and evolution of Foundation's on-premises AI infrastructure — VM environment, DGX Spark nodes, and supporting services. *(Renamed from "Foundation AI Infrastructure" on 2026-04-29.)*
 
 ## Second Brain Location
-`/Users/andrewhowerton/Documents/Second Brain/3. Planning/6. Work Projects/0. Active Priority/Foundation AI Infrastructure/`
+`/Users/andrewhowerton/Documents/Second Brain/3. Planning/6. Work Projects/0. Active Priority/AI Distributed Inference Cluster/`
 Sync all session updates back here before closing.
 
 ## Session Protocol

@@ -1,4 +1,4 @@
-# vLLM Stack
+# AI Distributed Inference Cluster
 
 Self-hosted AI inference across one or more GPU machines. All models served through an OpenAI-compatible API — drop-in replacement for cloud endpoints with no per-token cost and no data leaving the network.
 

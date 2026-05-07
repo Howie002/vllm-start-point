@@ -1,8 +1,9 @@
-# Foundation AI Infrastructure - Notes
+# AI Distributed Inference Cluster — Notes
+*(Renamed from "Foundation AI Infrastructure" / repo `vllm-start-point` on 2026-04-29.)*
 
 ## 2026-04-27 — Merged HP Z Workstation Pilot into this project
 
-The standalone "HP Z Workstation Pilot" project was redundant — the Z Workstation work is part of Foundation AI Infrastructure's hardware fleet evaluation, not a separate project. Merged the pilot's content into this project's Overview.md as a new "HP Z Workstation Pilot Detail" section, preserving all the original spec / purchase plan / role information.
+The standalone "HP Z Workstation Pilot" project was redundant — the Z Workstation work is part of this project's hardware fleet evaluation, not a separate project. Merged the pilot's content into this project's Overview.md as a new "HP Z Workstation Pilot Detail" section, preserving all the original spec / purchase plan / role information.
 
 **Changes:**
 - Folder `0. Active Priority/HP Z Workstation Pilot/` deleted (content fully migrated)
@@ -27,7 +28,7 @@ Pilot status unchanged: TENTATIVE — awaiting hardware arrival. RTX Pro 6000 Bl
 
 ## 2026-04-20 — Repo Linked + v2 Cluster Status Catch-up
 
-**Context:** Linked Foundation AI Infrastructure project to the `vllm-start-point` repo. First sync under the new Second Brain ↔ Repo protocol. Previously flagged as "no repo" — corrected.
+**Context:** Linked Foundation AI Infrastructure project to the `vllm-start-point` repo. First sync under the new Second Brain ↔ Repo protocol. Previously flagged as "no repo" — corrected. *(Project subsequently renamed to "AI Distributed Inference Cluster" / repo `AI-Distributed-Inference-Cluster` on 2026-04-29.)*
 
 **Since Last SB Update (2026-03-05 → 2026-04-20) — major commits in repo:**
 - `3e188e6` Initial commit: full vLLM dashboard with agent control system

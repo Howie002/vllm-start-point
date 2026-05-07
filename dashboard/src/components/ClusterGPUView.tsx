@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import type { GPU, ClusterNodeStatus, NodeConfig } from "@/lib/types";
+import type { GPU, ClusterNodeStatus, NodeConfig, PendingLaunch, VLLMInstance } from "@/lib/types";
+import { LaunchLogModal } from "./LaunchLogModal";
 
 function vramPct(gpu: GPU) { return gpu.vram_total_mb > 0 ? Math.round((gpu.vram_used_mb / gpu.vram_total_mb) * 100) : 0; }
 function vramGB(mb: number) { return (mb / 1024).toFixed(1); }
@@ -37,10 +38,88 @@ function StatBox({ label, value, sub, valueClass = "text-white", bar }: StatBoxP
 
 interface Props {
   nodeStatuses: ClusterNodeStatus[];
+  pendingLaunches?: PendingLaunch[];
 }
 
-export function ClusterGPUView({ nodeStatuses }: Props) {
+// Banner shown above the VRAM bar while a model is loading on a GPU. Driven
+// by either an optimistic pending-launch entry (kicked off in the last few
+// minutes, before the agent has reported the new instance) or by the agent's
+// own "loading" status on a real instance whose /health is still 503ing.
+// onViewLog is wired up only when we know a port to read from — the agent's
+// per-launch log is keyed by listening port, which is unknown for a brand-new
+// pending launch until the next /status poll surfaces the spawned process.
+function LoadingBanner({
+  label, sub, onViewLog,
+}: { label: string; sub?: string; onViewLog?: () => void }) {
+  return (
+    <div className="rounded bg-amber-900/30 border border-amber-800/60 px-2 py-1 flex items-center gap-1.5 overflow-hidden">
+      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse flex-shrink-0" />
+      <div className="min-w-0 flex-1">
+        <p className="text-[11px] font-medium text-amber-200 truncate" title={label}>{label}</p>
+        {sub && <p className="text-[10px] text-amber-300/70 truncate">{sub}</p>}
+      </div>
+      {onViewLog && (
+        <button
+          onClick={e => { e.stopPropagation(); onViewLog(); }}
+          className="text-[10px] px-1.5 py-0.5 rounded bg-amber-800/40 text-amber-200 hover:bg-amber-700/50 flex-shrink-0"
+          title="Show vLLM startup log for this launch"
+        >
+          log
+        </button>
+      )}
+    </div>
+  );
+}
+
+function elapsedLabel(startedAt: number): string {
+  const sec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const rem = sec % 60;
+  return `${min}m ${rem}s`;
+}
+
+// Pick the most relevant loading state to surface on a GPU card. Server-side
+// `loading` instance wins when present (it means the process is alive and
+// allocating memory — the most accurate signal). Otherwise we fall back to
+// the optimistic pending-launch entry that was added the moment Deploy
+// returned, which covers the gap before the next /status poll.
+//
+// `port` lets the banner deep-link into the per-launch log. We only have it
+// for real instances (the agent assigns the listening port when spawning);
+// for purely pending launches we don't yet know the port, so the View-log
+// button is hidden until /status surfaces the new process.
+function gpuLoadingState(
+  gpu: GPU,
+  instances: VLLMInstance[],
+  node: NodeConfig,
+  pendingLaunches: PendingLaunch[],
+): { label: string; sub?: string; port?: number } | null {
+  const loadingInst = instances.find(i => i.gpu_index === gpu.index && i.status === "loading");
+  if (loadingInst) {
+    return {
+      label: `Loading ${loadingInst.served_name ?? loadingInst.model_id ?? "model"}`,
+      sub: loadingInst.model_id ? `${loadingInst.model_id} · waiting for /health` : "waiting for /health",
+      port: loadingInst.port,
+    };
+  }
+  const pending = pendingLaunches.find(
+    p => p.nodeIp === node.ip
+      && p.nodeAgentPort === node.agent_port
+      && p.gpuIndices.includes(gpu.index),
+  );
+  if (pending) {
+    return {
+      label: `Loading ${pending.modelName}`,
+      sub: `started ${elapsedLabel(pending.startedAt)} ago`,
+    };
+  }
+  return null;
+}
+
+export function ClusterGPUView({ nodeStatuses, pendingLaunches = [] }: Props) {
   const [expanded, setExpanded] = useState<{ nodeKey: string; gpuIndex: number } | null>(null);
+  const [logViewer, setLogViewer] = useState<{ node: NodeConfig; port: number; label: string } | null>(null);
 
   // Flatten all GPUs from all online nodes into one list
   const flatGpus: FlatGPU[] = nodeStatuses.flatMap(ns => {
@@ -83,6 +162,7 @@ export function ClusterGPUView({ nodeStatuses }: Props) {
             {flatGpus.map(({ nodeKey, node, ns, gpu }) => {
               const pct    = vramPct(gpu);
               const isOpen = expanded?.nodeKey === nodeKey && expanded?.gpuIndex === gpu.index;
+              const loadingState = gpuLoadingState(gpu, ns.status!.instances, node, pendingLaunches);
               return (
                 <div
                   key={`${nodeKey}:${gpu.index}`}
@@ -116,6 +196,19 @@ export function ClusterGPUView({ nodeStatuses }: Props) {
 
                   <p className="text-xs font-medium text-white leading-tight truncate" title={gpu.name}>{gpu.name}</p>
 
+                  {/* Loading banner — appears immediately after Deploy and stays until the
+                      instance reports healthy. Pending-launch state covers the pre-poll gap;
+                      the agent's own "loading" status takes over once it sees the process. */}
+                  {loadingState && (
+                    <LoadingBanner
+                      label={loadingState.label}
+                      sub={loadingState.sub}
+                      onViewLog={loadingState.port != null
+                        ? () => setLogViewer({ node, port: loadingState.port!, label: loadingState.label })
+                        : undefined}
+                    />
+                  )}
+
                   {/* VRAM bar */}
                   <div>
                     <div className="flex justify-between text-xs text-slate-400 mb-1">
@@ -143,6 +236,19 @@ export function ClusterGPUView({ nodeStatuses }: Props) {
                             }`} />
                             <span className="text-slate-300 truncate flex-1 min-w-0">{proc.label}</span>
                             <span className="text-slate-500 flex-shrink-0">{vramGB(proc.vram_used_mb)}G</span>
+                            {vllmInst && (
+                              <button
+                                onClick={() => setLogViewer({
+                                  node,
+                                  port: vllmInst.port,
+                                  label: vllmInst.served_name ?? vllmInst.model_id ?? `port ${vllmInst.port}`,
+                                })}
+                                className="text-[10px] px-1 rounded text-slate-500 hover:text-cyan-300 hover:bg-slate-700 flex-shrink-0"
+                                title="View vLLM launch log"
+                              >
+                                log
+                              </button>
+                            )}
                           </div>
                         );
                       })}
@@ -182,6 +288,16 @@ export function ClusterGPUView({ nodeStatuses }: Props) {
             </div>
           );
         })()}
+
+        {/* Launch log viewer — opened from the loading banner or any process row */}
+        {logViewer && (
+          <LaunchLogModal
+            node={logViewer.node}
+            port={logViewer.port}
+            label={logViewer.label}
+            onClose={() => setLogViewer(null)}
+          />
+        )}
 
         {/* Offline nodes */}
         {offlineNodes.length > 0 && (

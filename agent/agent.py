@@ -1,5 +1,5 @@
 """
-vLLM Stack Control Agent
+AI Distributed Inference Cluster — Control Agent
 Runs on the GPU machine. Exposes a REST API for the dashboard (VM or local).
 Port: 5000
 """
@@ -43,7 +43,7 @@ PROXY_PID_FILE      = REPO_ROOT / "litellm" / ".proxy_pid"
 PROXY_START_SH      = REPO_ROOT / "litellm" / "start_proxy.sh"
 HF_CACHE            = Path.home() / ".cache" / "huggingface" / "hub"
 
-DEFAULT_REPO_URL    = "https://github.com/Howie002/vllm-start-point.git"
+DEFAULT_REPO_URL    = "https://github.com/Howie002/AI-Distributed-Inference-Cluster.git"
 DEFAULT_BRANCH      = "main"
 UPDATE_REFRESH_SEC  = 600   # 10 min
 
@@ -91,7 +91,7 @@ CLUSTER_PROXY_URL = _cluster_proxy_url()
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="vLLM Stack Control Agent", version="1.0.0")
+app = FastAPI(title="AI Distributed Inference Cluster — Control Agent", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -128,6 +128,43 @@ class StackConfig(BaseModel):
     description: str = ""
     models: list[StackModelEntry]
 
+# ── Hot-path TTL cache ────────────────────────────────────────────────────────
+# Multiple dashboards / tabs polling /status simultaneously shouldn't each fork
+# nvidia-smi or walk /proc. A short TTL on the expensive read paths lets
+# concurrent callers share a snapshot. Lock is only held while reading the
+# cache map; the actual computation runs unlocked, so a concurrent miss can
+# safely race (worst case: two computes during a cold window, both write the
+# same value). Invalidate on writes that change the underlying state
+# (instance launch / stop / proxy restart).
+
+class _TTLCache:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._store: dict[str, tuple[float, object]] = {}
+
+    def get_or_compute(self, key: str, ttl_s: float, fn):
+        now = time.time()
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is not None and now - entry[0] < ttl_s:
+                return entry[1]
+        value = fn()
+        with self._lock:
+            self._store[key] = (time.time(), value)
+        return value
+
+    def invalidate(self, *keys: str) -> None:
+        with self._lock:
+            if not keys:
+                self._store.clear()
+            else:
+                for k in keys:
+                    self._store.pop(k, None)
+
+
+_HOT_CACHE = _TTLCache()
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _nvidia_smi_query(fields: str) -> list[dict]:
@@ -140,6 +177,56 @@ def _nvidia_smi_query(fields: str) -> list[dict]:
         values = [v.strip() for v in line.split(",")]
         rows.append(values)
     return rows
+
+
+# nvidia-smi index→uuid map. Practically static — cached longer.
+def _gpu_uuid_to_idx() -> dict[str, int]:
+    def _compute() -> dict[str, int]:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            return {}
+        result: dict[str, int] = {}
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 2:
+                try:
+                    result[parts[1]] = int(parts[0])
+                except ValueError:
+                    pass
+        return result
+    return _HOT_CACHE.get_or_compute("gpu_uuid_to_idx", 30.0, _compute)
+
+
+# Compute-apps snapshot: list of (pid, gpu_uuid, used_memory_mb).
+# Short TTL — has to reflect the live process set inside a single /status call.
+def _compute_apps_snapshot() -> list[tuple[int, str, int]]:
+    def _compute() -> list[tuple[int, str, int]]:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi",
+                 "--query-compute-apps=pid,gpu_uuid,used_memory",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            return []
+        result: list[tuple[int, str, int]] = []
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[0])
+                vram = int(parts[2]) if parts[2].isdigit() else 0
+                result.append((pid, parts[1], vram))
+            except ValueError:
+                pass
+        return result
+    return _HOT_CACHE.get_or_compute("compute_apps", 1.0, _compute)
 
 
 def _http_get(url: str, headers: dict = {}) -> Optional[dict]:
@@ -263,6 +350,16 @@ def _proxy_write_and_restart(
             '  master_key: "none"\n'
         )
 
+        # No-op when nothing changed — important now that the periodic ghost
+        # cleanup loop calls us every minute. Restarting the proxy on every
+        # tick would interrupt in-flight requests for no reason. We still
+        # restart if the proxy process is missing (covers crashed proxy or
+        # PID-file drift), since byte-equal config alone isn't proof it's
+        # actually serving.
+        existing = PROXY_CONFIG_PATH.read_text() if PROXY_CONFIG_PATH.exists() else None
+        if existing == config_text and _proxy_alive():
+            return
+
         PROXY_CONFIG_PATH.write_text(config_text)
 
         # Stop existing proxy
@@ -283,6 +380,39 @@ def _proxy_write_and_restart(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+        # Proxy URL/health/model-list just changed — invalidate /status so the
+        # next dashboard poll picks up the new proxy state.
+        _HOT_CACHE.invalidate("full_status")
+
+
+def _proxy_alive() -> bool:
+    """True iff the PID file points at a process that still exists."""
+    if not PROXY_PID_FILE.exists():
+        return False
+    try:
+        pid = int(PROXY_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _proxy_cleanup_loop():
+    """Background loop on master/both nodes — periodically reconciles the
+    proxy's cluster_config.yaml against the live (served_name, ip, port) set
+    across the cluster. The hot path (launch / stop) already syncs
+    immediately; this loop catches the case where a vLLM process died on its
+    own (load failure, OOM, segfault) and left a ghost entry in the proxy.
+    Without it, /v1/models keeps advertising the dead model and inference
+    requests fail with connection-refused at the proxy. _proxy_write_and_restart
+    is a no-op when the YAML is already correct, so this is cheap to run."""
+    while True:
+        time.sleep(60)
+        try:
+            _proxy_write_and_restart()
+        except Exception:
+            pass
 
 
 def _get_pid_on_port(port: int) -> Optional[int]:
@@ -320,36 +450,15 @@ def _get_gpu_for_pid(pid: int, gpu_pids: dict[int, list[int]]) -> Optional[int]:
 
 
 def _scan_vllm_instances() -> list[dict]:
-    # Map GPU index -> list of compute PIDs
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        # Get GPU uuid -> index mapping
-        uuid_result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        uuid_to_idx = {}
-        for line in uuid_result.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) == 2:
-                uuid_to_idx[parts[1]] = int(parts[0])
-
-        gpu_pids: dict[int, list[int]] = {}
-        for line in result.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 2:
-                try:
-                    pid = int(parts[0])
-                    gpu_idx = uuid_to_idx.get(parts[1])
-                    if gpu_idx is not None:
-                        gpu_pids.setdefault(gpu_idx, []).append(pid)
-                except ValueError:
-                    pass
-    except Exception:
-        gpu_pids = {}
+    # Reuse the cached uuid map + compute-apps snapshot. Within a single /status
+    # request these are computed once and shared across helpers, so we don't
+    # fork nvidia-smi 5× per poll cycle.
+    uuid_to_idx = _gpu_uuid_to_idx()
+    gpu_pids: dict[int, list[int]] = {}
+    for pid, gpu_uuid, _vram in _compute_apps_snapshot():
+        gpu_idx = uuid_to_idx.get(gpu_uuid)
+        if gpu_idx is not None:
+            gpu_pids.setdefault(gpu_idx, []).append(pid)
 
     port_map = _listening_port_map()
     instances = []
@@ -441,53 +550,19 @@ def _scan_vllm_instances() -> list[dict]:
 
 def _get_gpu_processes() -> dict[int, list[dict]]:
     """Returns {gpu_index: [process_info, ...]} for every process using GPU VRAM."""
-    try:
-        # UUID → index map
-        uuid_result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        uuid_to_idx: dict[str, int] = {}
-        for line in uuid_result.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) == 2:
-                try:
-                    uuid_to_idx[parts[1]] = int(parts[0])
-                except ValueError:
-                    pass
-
-        # All compute processes
-        apps_result = subprocess.run(
-            ["nvidia-smi",
-             "--query-compute-apps=pid,gpu_uuid,used_memory",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5
-        )
-
-        by_gpu: dict[int, list[dict]] = {}
-        for line in apps_result.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 3:
-                continue
-            try:
-                pid      = int(parts[0])
-                gpu_idx  = uuid_to_idx.get(parts[1])
-                vram_mb  = int(parts[2]) if parts[2].isdigit() else 0
-            except ValueError:
-                continue
-            if gpu_idx is None:
-                continue
-
-            label = _process_label(pid)
-            by_gpu.setdefault(gpu_idx, []).append({
-                "pid":          pid,
-                "label":        label,
-                "vram_used_mb": vram_mb,
-            })
-
-        return by_gpu
-    except Exception:
-        return {}
+    uuid_to_idx = _gpu_uuid_to_idx()
+    by_gpu: dict[int, list[dict]] = {}
+    for pid, gpu_uuid, vram_mb in _compute_apps_snapshot():
+        gpu_idx = uuid_to_idx.get(gpu_uuid)
+        if gpu_idx is None:
+            continue
+        label = _process_label(pid)
+        by_gpu.setdefault(gpu_idx, []).append({
+            "pid":          pid,
+            "label":        label,
+            "vram_used_mb": vram_mb,
+        })
+    return by_gpu
 
 
 def _process_label(pid: int) -> str:
@@ -719,6 +794,11 @@ def launch_instance(req: LaunchRequest):
             start_new_session=True,
         )
 
+    # The cluster state just changed (new vLLM process, new listening port);
+    # bust the hot cache so the next /status reflects it without waiting up to
+    # STATUS_CACHE_TTL_S.
+    _HOT_CACHE.invalidate("full_status", "compute_apps")
+
     # Update the proxy config (write YAML + restart proxy). Runs in background
     # so the launch response returns immediately while the proxy restarts.
     if req.register_with_proxy:
@@ -766,6 +846,9 @@ def stop_instance(port: int, deregister: bool = True):
     except psutil.NoSuchProcess:
         pass
 
+    # Process is gone; reset the hot cache so /status reflects it right away.
+    _HOT_CACHE.invalidate("full_status", "compute_apps")
+
     # Update proxy config to remove stopped instance
     if deregister and served_name:
         threading.Thread(
@@ -775,6 +858,64 @@ def stop_instance(port: int, deregister: bool = True):
         ).start()
 
     return {"stopped": True, "port": port, "pid": pid}
+
+
+@app.get("/logs/dynamic/{port}")
+def get_dynamic_log(port: int, tail: int = 200, max_bytes: int = 256 * 1024):
+    """
+    Return the tail of the per-instance vLLM stdout/stderr log captured by
+    /instances/launch. Each launch writes to logs/dynamic_<port>.log in
+    truncate mode, so this surfaces the most recent attempt for that port.
+    Tail-only by design — startup logs from a 49B model can be megabytes,
+    and the dashboard only needs the last screen-worth to diagnose a crash.
+
+    Hard caps: tail clamped to [1, 5000] lines; max_bytes clamped to
+    [4096, 4MB] of trailing data. We always seek-from-end, so a multi-MB
+    log file doesn't pin the agent reading what we'll throw away anyway.
+    """
+    if port < 1 or port > 65535:
+        raise HTTPException(status_code=400, detail="port must be a valid TCP port")
+    tail = max(1, min(int(tail), 5000))
+    max_bytes = max(4096, min(int(max_bytes), 4 * 1024 * 1024))
+
+    log_path = REPO_ROOT / "logs" / f"dynamic_{port}.log"
+    if not log_path.exists():
+        return {
+            "port": port,
+            "exists": False,
+            "size_bytes": 0,
+            "mtime": None,
+            "lines": [],
+            "truncated": False,
+            "path": str(log_path),
+        }
+
+    stat = log_path.stat()
+    size = stat.st_size
+    truncated = False
+    with open(log_path, "rb") as f:
+        if size > max_bytes:
+            f.seek(size - max_bytes)
+            truncated = True
+            # Drop the partial first line caused by the seek.
+            f.readline()
+        data = f.read()
+
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if len(lines) > tail:
+        lines = lines[-tail:]
+        truncated = True
+
+    return {
+        "port": port,
+        "exists": True,
+        "size_bytes": size,
+        "mtime": stat.st_mtime,
+        "lines": lines,
+        "truncated": truncated,
+        "path": str(log_path),
+    }
 
 
 def _load_library() -> list[dict]:
@@ -1372,18 +1513,23 @@ def get_nodes():
 
 class RenameNodeRequest(BaseModel):
     name: str
-    # agent_port is optional — scoping the rename to a specific (ip, port) pair
+    # agent_port is optional — scoping the update to a specific (ip, port) pair
     # disambiguates if two nodes ever shared an IP but different ports.
     agent_port: int | None = None
+    # When supplied, also update the matched node's IP / agent_port to these
+    # values. Lets the dashboard renumber a node without removing + re-adding.
+    new_ip: str | None = None
+    new_agent_port: int | None = None
 
 
 @app.patch("/nodes/{ip}")
 def rename_node(ip: str, req: RenameNodeRequest):
     """
-    Rename a node registered in this agent's node_config.json. Intended to be
-    called on master/both — child agents have an empty nodes[] and will 404.
-    Child-served dashboards proxy through /api/nodes/rename, which forwards
-    here using the master IP from local config.
+    Update a node registered in this agent's node_config.json — name and
+    optionally ip / agent_port. Intended to be called on master/both — child
+    agents have an empty nodes[] and will 404. Child-served dashboards proxy
+    through /api/nodes/rename or /api/nodes/edit, which forward here using the
+    master IP from local config.
     """
     if not NODE_CONFIG_PATH.exists():
         raise HTTPException(status_code=500, detail="node_config.json not found")
@@ -1393,15 +1539,54 @@ def rename_node(ip: str, req: RenameNodeRequest):
         raise HTTPException(status_code=500, detail=f"node_config.json unreadable: {e}")
 
     nodes = config.get("nodes") or []
+
+    # If the caller is changing the IP/port, make sure the new pair doesn't
+    # collide with another existing node.
+    target_ip = req.new_ip or ip
+    target_port = req.new_agent_port if req.new_agent_port is not None else None
+    for n in nodes:
+        if n.get("ip") == ip and (req.agent_port is None or n.get("agent_port") == req.agent_port):
+            continue  # this is the row we're about to edit
+        if n.get("ip") == target_ip and (
+            target_port is None or n.get("agent_port") == target_port or n.get("agent_port") == req.agent_port
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Another node already registered at {target_ip}:{n.get('agent_port')}",
+            )
+
     for n in nodes:
         if n.get("ip") != ip:
             continue
         if req.agent_port is not None and n.get("agent_port") != req.agent_port:
             continue
         n["name"] = req.name
+        if req.new_ip is not None:
+            n["ip"] = req.new_ip
+        if req.new_agent_port is not None:
+            n["agent_port"] = req.new_agent_port
+        # If ip/port changed, regenerate setup_cmd so the help-text command
+        # the dashboard shows for re-running setup on that machine matches
+        # the new address. Master IP/port come from this agent's own config.
+        if req.new_ip is not None or req.new_agent_port is not None:
+            master_ip = config.get("master", {}).get("ip") or config.get("this_ip") or "MASTER_IP"
+            master_agent_port = config.get("master", {}).get("agent_port", 5000)
+            n["setup_cmd"] = (
+                f"VLLM_NONINTERACTIVE=1 VLLM_ROLE=child "
+                f"VLLM_THIS_IP={n['ip']} "
+                f"VLLM_MASTER_IP={master_ip} "
+                f"VLLM_MASTER_AGENT_PORT={master_agent_port} "
+                f"VLLM_AGENT_PORT={n['agent_port']} "
+                f"bash ./node.sh setup"
+            )
         config["nodes"] = nodes
         NODE_CONFIG_PATH.write_text(json.dumps(config, indent=2))
-        return {"renamed": ip, "name": req.name}
+        return {
+            "updated": ip,
+            "name": n["name"],
+            "ip": n["ip"],
+            "agent_port": n["agent_port"],
+        }
     raise HTTPException(status_code=404, detail=f"Node {ip} not registered here")
 
 
@@ -1686,9 +1871,13 @@ def update_pull():
     }
 
 
-@app.get("/status")
-def get_full_status():
-    """All data in a single call — used for dashboard polling."""
+def _compute_full_status() -> dict:
+    """Build the /status payload by calling each component once.
+
+    Splitting the inner-call layer from the cache layer makes it trivial to
+    invalidate on state changes (launch / stop / proxy restart) — see the
+    `_HOT_CACHE.invalidate("full_status", ...)` calls on those write paths.
+    """
     gpus = get_gpus()
     instances = get_instances()
     proxy = get_proxy_status()
@@ -1700,6 +1889,18 @@ def get_full_status():
         "proxy": proxy,
         "update": update,
     }
+
+
+# How long /status responses are reused across concurrent dashboard polls.
+# Multiple tabs / multiple dashboards each polling every 15s will still fan
+# in to a single fork-heavy run on the agent within this window.
+STATUS_CACHE_TTL_S = 3.0
+
+
+@app.get("/status")
+def get_full_status():
+    """All data in a single call — used for dashboard polling."""
+    return _HOT_CACHE.get_or_compute("full_status", STATUS_CACHE_TTL_S, _compute_full_status)
 
 
 # ── Startup re-registration ───────────────────────────────────────────────────
@@ -1725,6 +1926,10 @@ _SAMPLER: MetricsSampler | None = None
 def _on_startup():
     threading.Thread(target=_reregister_existing_instances, daemon=True).start()
     threading.Thread(target=_update_refresh_loop, daemon=True).start()
+    # Only the proxy host runs the periodic cleanup; child nodes have nothing
+    # to reconcile and would just spam the master with /proxy/sync requests.
+    if _NODE_CFG.get("role", "") in ("master", "both"):
+        threading.Thread(target=_proxy_cleanup_loop, daemon=True).start()
 
     # Start the per-node metrics sampler. Uses the currently registered node
     # name from node_config.json so JSONL rows are self-describing across

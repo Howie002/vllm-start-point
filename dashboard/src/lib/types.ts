@@ -102,6 +102,22 @@ export interface ClusterGPU {
   gpu: GPU;
 }
 
+// Optimistic record of a model launch the user just kicked off, kept in
+// dashboard state until the agent's /status surfaces a matching healthy
+// instance (or a hard timeout fires). Bridges the up-to-15s gap between
+// Deploy succeeding and the next status poll picking up the new vLLM
+// process, so the GPU view can render a "Loading…" banner immediately
+// instead of looking idle for that window.
+export interface PendingLaunch {
+  nodeIp: string;
+  nodeAgentPort: number;
+  gpuIndices: number[];
+  modelId: string;
+  modelName: string;
+  servedName: string;
+  startedAt: number;
+}
+
 export interface RepackAssignment {
   served_name: string;
   model_id: string;
@@ -241,6 +257,16 @@ export interface CacheStats {
   disk_used_bytes: number;
   disk_free_bytes: number;
   cache_path: string;
+}
+
+export interface DynamicLog {
+  port: number;
+  exists: boolean;
+  size_bytes: number;
+  mtime: number | null;
+  lines: string[];
+  truncated: boolean;
+  path: string;
 }
 
 export interface DownloadState {

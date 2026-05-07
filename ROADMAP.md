@@ -1,7 +1,7 @@
-# Foundation AI Infrastructure — Roadmap
+# AI Distributed Inference Cluster — Roadmap
 
-**Repo:** [github.com/Howie002/vllm-start-point](https://github.com/Howie002/vllm-start-point) (private, active on `dev`)
-**Last Synced:** 2026-04-20
+**Repo:** [github.com/Howie002/AI-Distributed-Inference-Cluster](https://github.com/Howie002/AI-Distributed-Inference-Cluster) (private, active on `dev`)
+**Last Synced:** 2026-05-07
 **Current Phase:** v2 Cluster — operational hardening + analytics follow-on
 **Target Production:** Ongoing operational service
 
@@ -56,6 +56,30 @@ Operational tasks layered on top of the running cluster. Not code features — h
 - [ ] Cancel button available throughout launch; kills the spawned process and cleans up GPU allocation
 - [ ] If no stdout is observed for >30 s, UI shows `No activity for 30s — last stage: X` so user knows it is not frozen
 - [ ] After launch completes, modal auto-dismisses on success and persists on failure
+
+---
+
+### 🟠 Dashboard UI performance & stability hardening
+
+**Priority:** Next up — these are the highest-leverage UI perf and resilience fixes surfaced by a code review on 2026-05-07. Each item is independently shippable.
+
+**Critical**
+- [x] **Stop tearing down ModelLibrary poll intervals on every parent render** — [`dashboard/src/components/ModelLibrary.tsx`](dashboard/src/components/ModelLibrary.tsx). Memoized `onlineNodes` against a stable string signature of online node keys; `useCallback`/`useEffect` deps no longer invalidate every render, so cache (15 s) and download (2 s) intervals stay alive across status ticks. *(2026-05-07)*
+
+**High**
+- [x] **Status poll: skip-if-busy + latest-only guard** — [`dashboard/src/app/page.tsx`](dashboard/src/app/page.tsx). Added `inFlightRef` to drop overlapping ticks and a monotonic `requestIdRef` so a slow tick that lands after a newer one can't overwrite state. *(2026-05-07)*
+- [x] **Fetch timeout on `/api/nodes/edit` and `/api/nodes/rename` proxy paths** — [`edit/route.ts`](dashboard/src/app/api/nodes/edit/route.ts), [`rename/route.ts`](dashboard/src/app/api/nodes/rename/route.ts). Wrapped the child→master PATCH in `AbortSignal.timeout(8000)` and return `504` with a clear message on unreachable master. (`add/route.ts` has no proxy fetch.) *(2026-05-07)*
+- [x] **"Restart dashboard" polls for health instead of sleeping 60 s** — [`dashboard/src/components/NodeCard.tsx`](dashboard/src/components/NodeCard.tsx). Polls a relative `/api/nodes` (when on this node's dashboard) or the agent's `/status` (cross-node), waits for down→back transition, max 3 minutes, surfaces failure instead of force-reloading a broken page. *(2026-05-07)*
+
+**Medium**
+- [x] **Atomic config writes** — `edit/`, `add/`, `rename/` route handlers now go through a `writeJsonAtomic(path, data)` helper that writes to `node_config.json.tmp` and `renameSync`s into place. Crash mid-write no longer corrupts the canonical config. *(2026-05-07)*
+- [x] **Removed dead `useEffect`** — [`dashboard/src/components/SettingsView.tsx`](dashboard/src/components/SettingsView.tsx) and its now-unused `useEffect` import. *(2026-05-07)*
+
+**Low (deferred — pick up if larger clusters expose jank)**
+- `React.memo` wrappers for `ClusterServiceList`, `NodeCard`, `ClusterGPUView` so the 15 s status tick doesn't re-render every row.
+- AnalyticsView: split the four chart memos so changing one input doesn't recompute all four.
+- AddNodeModal "Copied!" `setTimeout` cleanup — minor unmounted-setState warning.
+- SettingsView `pullNode`: useRef-backed in-flight set keyed by node, to harden against the small double-click race window the disabled state already mostly covers.
 
 ---
 
@@ -232,4 +256,4 @@ Small or uncertain items that may not be worth building but are worth rememberin
 
 ---
 
-**Last Updated:** 2026-04-28
+**Last Updated:** 2026-05-07
