@@ -2,7 +2,7 @@ import type {
   FullStatus, ModelEntry, LaunchRequest, NodeConfig, StackConfig, StackModelConfig,
   PreflightResult, RepackResult, RepackAssignment, MetricsQueryResult,
   HFTokenStatus, HFLookup, CachedModel, CacheStats, DownloadState,
-  UpdateStatus, UpdateConfig, DynamicLog,
+  UpdateStatus, UpdateConfig, DynamicLog, DiagnoseResult,
 } from "./types";
 
 // Build a direct URL to a node's agent (browser calls this cross-origin)
@@ -85,6 +85,10 @@ export function createNodeApi(node: NodeConfig) {
     // diagnose silent crashes — vLLM dies during init, dashboard never sees
     // a healthy instance, and the only evidence is in this file.
     dynamicLog:           (port: number, tail = 200)                => get<DynamicLog>             (base, `/logs/dynamic/${port}?tail=${tail}`),
+
+    // Forensic snapshot — GPU/RAM allocations the agent doesn't own.
+    // Surfaces reparented vLLM workers, leaked shm, etc. Backs DiagnoseModal.
+    diagnose:             ()                                        => get<DiagnoseResult>         (base, "/diagnose", 15000),
 
     // HF integration — per node
     hfTokenStatus:   ()                      => get<HFTokenStatus> (base, "/models/hf/token"),

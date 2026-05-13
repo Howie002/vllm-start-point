@@ -269,6 +269,41 @@ export interface DynamicLog {
   path: string;
 }
 
+// /diagnose response — see agent.py `diagnose()` and ROADMAP entry on
+// orphan-vLLM / RAM-leak forensics for the rationale on each field.
+export interface DiagnoseGpuApp {
+  pid: number;
+  name: string;
+  vram_mb: number | null;
+}
+export interface DiagnoseProc {
+  pid: number;
+  cmd: string;
+  rss_mb: number | null;
+}
+export interface DiagnoseShm {
+  name: string;
+  size_bytes: number;
+  size_mb: number;
+  mtime: number;
+}
+export interface DiagnoseSysvShm {
+  key: string;
+  shmid: number;
+  owner: string;
+  bytes: number;
+  nattch: number;
+}
+export interface DiagnoseResult {
+  gpu_compute_apps: DiagnoseGpuApp[];
+  reparented_python: DiagnoseProc[];
+  dev_shm: DiagnoseShm[];
+  sysv_shm: DiagnoseSysvShm[];
+  tracked_instances: VLLMInstance[];
+  unowned_gpu_compute_apps: DiagnoseGpuApp[];
+  warnings: string[];
+}
+
 export interface DownloadState {
   model_id: string;
   state: "pending" | "downloading" | "complete" | "error" | "canceled";

@@ -67,6 +67,16 @@ export function DeployModal({ model, clusterGpus, allInstances, onClose, onLaunc
   const [registerProxy, setRegisterProxy] = useState(true);
   const [launching, setLaunching]     = useState(false);
   const [error, setError]             = useState<string | null>(null);
+  // Structured failure (HTTP 422 from agent) — set when vLLM exited during
+  // startup before binding the port. log_tail lets the user see the actual
+  // stderr without opening LaunchLogModal.
+  const [launchFailure, setLaunchFailure] = useState<{
+    message: string;
+    exit_code: number | null;
+    log_tail: string[];
+    log_path: string;
+    auto_retry?: { reason: string; max_num_batched_tokens: number; result: string };
+  } | null>(null);
 
   const targetNode = selectedGpus[0]?.node ?? null;
 
@@ -96,7 +106,7 @@ export function DeployModal({ model, clusterGpus, allInstances, onClose, onLaunc
 
   async function handleLaunch() {
     if (!targetNode || selectedGpus.length === 0) { setError("Select at least one GPU."); return; }
-    setLaunching(true); setError(null);
+    setLaunching(true); setError(null); setLaunchFailure(null);
     try {
       const extraFlags = {
         ...model.flags,
@@ -122,7 +132,32 @@ export function DeployModal({ model, clusterGpus, allInstances, onClose, onLaunc
       });
       onLaunched(); onClose();
     } catch (e) {
-      setError(String(e)); setLaunching(false);
+      // The agent returns HTTP 422 with a JSON body like
+      // { detail: { message, exit_code, log_tail, log_path, auto_retry? } }
+      // when vLLM crashes during startup. Try to parse that out so we can
+      // render the stderr tail; fall back to the raw error string otherwise.
+      const raw = e instanceof Error ? e.message : String(e);
+      try {
+        const parsed = JSON.parse(raw);
+        const detail = parsed?.detail;
+        if (detail && typeof detail === "object" && Array.isArray(detail.log_tail)) {
+          setLaunchFailure({
+            message: detail.message ?? "Launch failed.",
+            exit_code: detail.exit_code ?? null,
+            log_tail: detail.log_tail,
+            log_path: detail.log_path ?? "",
+            auto_retry: detail.auto_retry,
+          });
+          setLaunching(false);
+          return;
+        }
+        if (detail && typeof detail === "string") {
+          setError(detail); setLaunching(false); return;
+        }
+      } catch {
+        // not JSON — fall through
+      }
+      setError(raw); setLaunching(false);
     }
   }
 
@@ -307,6 +342,29 @@ export function DeployModal({ model, clusterGpus, allInstances, onClose, onLaunc
           </div>
 
           {error && <p className="text-xs text-red-400 bg-red-900/20 border border-red-800 rounded-lg px-3 py-2">{error}</p>}
+
+          {launchFailure && (
+            <div className="text-xs bg-red-900/20 border border-red-800 rounded-lg overflow-hidden">
+              <div className="px-3 py-2 border-b border-red-800/60">
+                <p className="text-red-300 font-medium">vLLM crashed during startup</p>
+                <p className="text-red-400/80 mt-0.5">{launchFailure.message}</p>
+                {launchFailure.auto_retry && (
+                  <p className="text-amber-300/90 mt-1.5">
+                    Auto-retry with <code>--max-num-batched-tokens={launchFailure.auto_retry.max_num_batched_tokens}</code> ({launchFailure.auto_retry.reason}):{" "}
+                    <span className={launchFailure.auto_retry.result === "ok" ? "text-emerald-300" : "text-red-300"}>
+                      {launchFailure.auto_retry.result}
+                    </span>
+                  </p>
+                )}
+                <p className="text-red-500/60 font-mono mt-1">
+                  {launchFailure.log_path}
+                </p>
+              </div>
+              <pre className="bg-slate-950 text-slate-300 p-3 max-h-56 overflow-auto font-mono text-[11px] whitespace-pre-wrap break-all">
+                {launchFailure.log_tail.join("\n")}
+              </pre>
+            </div>
+          )}
         </div>
 
         <div className="px-6 py-4 border-t border-border flex gap-3 justify-end">

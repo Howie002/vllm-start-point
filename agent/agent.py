@@ -7,6 +7,7 @@ Port: 5000
 import concurrent.futures
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -725,6 +726,104 @@ def get_instances():
     return _scan_vllm_instances()
 
 
+# How long to babysit a freshly-spawned vLLM before declaring "alive enough to
+# return success." Config validation errors (bad flag combos, missing model,
+# unauthorized HF) fire within 1-2 seconds of vLLM's main(); 5 s catches those
+# without making the dashboard wait for a 30-second model load.
+EARLY_FAIL_WAIT_S = 5.0
+# Lines of vLLM stdout/stderr to include in a structured launch-failure response.
+# 60 covers the traceback plus the immediate preceding context.
+LAUNCH_ERROR_TAIL_LINES = 60
+
+# Matches the specific error that multimodal models like Gemma-4 raise when
+# vLLM force-disables chunked MM input but each image's tokens exceed the
+# default max_num_batched_tokens. Capture groups: (required, current).
+_CHUNKED_MM_RE = re.compile(
+    r"Chunked MM input disabled but max_tokens_per_mm_item \((\d+)\) "
+    r"is larger than max_num_batched_tokens \((\d+)\)"
+)
+
+
+def _read_log_tail(log_path: Path, n: int) -> list[str]:
+    """Best-effort tail of the per-launch log; returns [] on any error."""
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            lines = f.readlines()
+        return [ln.rstrip("\n") for ln in lines[-n:]]
+    except OSError:
+        return []
+
+
+def _wait_for_early_failure(
+    proc: subprocess.Popen, log_path: Path, timeout_s: float
+) -> tuple[bool, Optional[int], list[str]]:
+    """
+    Poll proc up to timeout_s. Returns (alive, exit_code, tail).
+      - alive=True  → process is still running at timeout (treat as healthy launch)
+      - alive=False → process exited; tail is the last LAUNCH_ERROR_TAIL_LINES of its log
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        ret = proc.poll()
+        if ret is not None:
+            return False, ret, _read_log_tail(log_path, LAUNCH_ERROR_TAIL_LINES)
+        time.sleep(0.2)
+    return True, None, []
+
+
+def _parse_chunked_mm_required(tail_lines: list[str]) -> Optional[int]:
+    """If the log tail contains the chunked-MM size error, return the required
+    max_tokens_per_mm_item value. Caller bumps --max-num-batched-tokens to fit."""
+    for line in tail_lines:
+        m = _CHUNKED_MM_RE.search(line)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _build_vllm_cmd(req: "LaunchRequest", flags: dict) -> list[str]:
+    """Build the vllm serve argv. Extracted so the chunked-MM retry path can
+    rebuild it with an added --max-num-batched-tokens without duplicating logic."""
+    gpu_mem_util = str(flags.get("gpu_memory_utilization", "0.85"))
+    cmd = [
+        VLLM_BIN, "serve", req.model_id,
+        "--port", str(req.port),
+        "--served-model-name", req.served_name,
+        "--gpu-memory-utilization", gpu_mem_util,
+        "--disable-uvicorn-access-log",
+    ]
+    if flags.get("quantization"):
+        cmd += ["--quantization", flags["quantization"]]
+    if flags.get("trust_remote_code"):
+        cmd += ["--trust-remote-code"]
+    if flags.get("runner"):
+        cmd += ["--runner", flags["runner"]]
+    if flags.get("hf_overrides"):
+        cmd += ["--hf-overrides", json.dumps(flags["hf_overrides"])]
+    if flags.get("tensor_parallel_size") and int(flags["tensor_parallel_size"]) > 1:
+        cmd += ["--tensor-parallel-size", str(flags["tensor_parallel_size"])]
+    if flags.get("max_model_len"):
+        cmd += ["--max-model-len", str(flags["max_model_len"])]
+    if flags.get("max_num_seqs"):
+        cmd += ["--max-num-seqs", str(flags["max_num_seqs"])]
+    if flags.get("max_num_batched_tokens"):
+        cmd += ["--max-num-batched-tokens", str(flags["max_num_batched_tokens"])]
+    return cmd
+
+
+def _spawn_vllm(cmd: list[str], env: dict, log_path: Path) -> subprocess.Popen:
+    """Open log in truncate mode, spawn vLLM in a new session so it survives
+    parent restarts. Returns the Popen handle."""
+    with open(log_path, "w") as log_f:
+        return subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_f,
+            stderr=log_f,
+            start_new_session=True,
+        )
+
+
 @app.post("/instances/launch")
 def launch_instance(req: LaunchRequest):
     if not Path(VLLM_BIN).exists():
@@ -751,48 +850,52 @@ def launch_instance(req: LaunchRequest):
         # surface the real error in its own log. `ok` means we're good.
 
     gpu_str = ",".join(str(g) for g in req.gpu_indices)
-
-    flags = req.extra_flags
-
-    # gpu_memory_utilization: flag overrides default of 0.85
-    gpu_mem_util = str(flags.get("gpu_memory_utilization", "0.85"))
-
-    cmd = [
-        VLLM_BIN, "serve", req.model_id,
-        "--port", str(req.port),
-        "--served-model-name", req.served_name,
-        "--gpu-memory-utilization", gpu_mem_util,
-        "--disable-uvicorn-access-log",
-    ]
-
-    if flags.get("quantization"):
-        cmd += ["--quantization", flags["quantization"]]
-    if flags.get("trust_remote_code"):
-        cmd += ["--trust-remote-code"]
-    if flags.get("runner"):
-        cmd += ["--runner", flags["runner"]]
-    if flags.get("hf_overrides"):
-        cmd += ["--hf-overrides", json.dumps(flags["hf_overrides"])]
-    if flags.get("tensor_parallel_size") and int(flags["tensor_parallel_size"]) > 1:
-        cmd += ["--tensor-parallel-size", str(flags["tensor_parallel_size"])]
-    if flags.get("max_model_len"):
-        cmd += ["--max-model-len", str(flags["max_model_len"])]
-    if flags.get("max_num_seqs"):
-        cmd += ["--max-num-seqs", str(flags["max_num_seqs"])]
+    flags = dict(req.extra_flags)
 
     log_path = Path(__file__).parent.parent / "logs" / f"dynamic_{req.port}.log"
     log_path.parent.mkdir(exist_ok=True)
 
     env = {**CUDA_ENV, "CUDA_VISIBLE_DEVICES": gpu_str}
 
-    with open(log_path, "w") as log_f:
-        proc = subprocess.Popen(
-            cmd,
-            env=env,
-            stdout=log_f,
-            stderr=log_f,
-            start_new_session=True,
-        )
+    cmd = _build_vllm_cmd(req, flags)
+    proc = _spawn_vllm(cmd, env, log_path)
+
+    # Babysit the process briefly so config-validation crashes (chunked-MM,
+    # bad HF auth that slipped past preflight, bogus flag combos) surface as
+    # a structured failure instead of a silent dead PID. See ROADMAP entry
+    # "Model launch feedback is opaque".
+    alive, exit_code, tail = _wait_for_early_failure(proc, log_path, EARLY_FAIL_WAIT_S)
+    auto_retry = None
+
+    if not alive:
+        # Process died before EARLY_FAIL_WAIT_S elapsed. Check for the one
+        # well-known recoverable error: chunked-MM models where the default
+        # max_num_batched_tokens is too small for a single image's tokens.
+        required = _parse_chunked_mm_required(tail)
+        if required is not None and not flags.get("max_num_batched_tokens"):
+            bumped = max(required, 4096)
+            flags["max_num_batched_tokens"] = bumped
+            cmd2 = _build_vllm_cmd(req, flags)
+            proc = _spawn_vllm(cmd2, env, log_path)
+            alive, exit_code, tail = _wait_for_early_failure(proc, log_path, EARLY_FAIL_WAIT_S)
+            auto_retry = {
+                "reason": "chunked_mm_max_tokens",
+                "max_num_batched_tokens": bumped,
+                "result": "ok" if alive else "crashed_again",
+            }
+
+        if not alive:
+            # Either non-recoverable or the retry also failed. Surface stderr
+            # tail so the dashboard can show the operator what vLLM said.
+            detail = {
+                "message": f"vLLM exited during startup (exit code {exit_code}) before binding port {req.port}.",
+                "exit_code": exit_code,
+                "log_tail": tail,
+                "log_path": str(log_path),
+            }
+            if auto_retry is not None:
+                detail["auto_retry"] = auto_retry
+            raise HTTPException(status_code=422, detail=detail)
 
     # The cluster state just changed (new vLLM process, new listening port);
     # bust the hot cache so the next /status reflects it without waiting up to
@@ -808,13 +911,16 @@ def launch_instance(req: LaunchRequest):
             daemon=True,
         ).start()
 
-    return {
+    response = {
         "pid": proc.pid,
         "port": req.port,
         "model_id": req.model_id,
         "gpu": gpu_str,
         "log": str(log_path),
     }
+    if auto_retry is not None:
+        response["auto_retry"] = auto_retry
+    return response
 
 
 @app.delete("/instances/{port}")
@@ -916,6 +1022,157 @@ def get_dynamic_log(port: int, tail: int = 200, max_bytes: int = 256 * 1024):
         "truncated": truncated,
         "path": str(log_path),
     }
+
+
+@app.get("/diagnose")
+def diagnose():
+    """
+    Runtime forensics for RAM/VRAM allocations the agent doesn't own. Catches
+    three failure modes that the regular /status can't see — see ROADMAP entry
+    "No way to forensically diagnose orphaned vLLM workers or RAM leaks":
+      1. vLLM workers reparented to PID 1 after a hard parent kill
+      2. PID-file desync between agent state and live processes
+      3. Leaked /dev/shm and SysV shm segments (unified-memory hardware: these
+         segments are system RAM)
+
+    Best-effort throughout — partial failures populate "warnings" instead of
+    failing the whole route, since the point is forensics during an incident.
+    """
+    result: dict = {
+        "gpu_compute_apps": [],
+        "reparented_python": [],
+        "dev_shm": [],
+        "sysv_shm": [],
+        "tracked_instances": [],
+        "unowned_gpu_compute_apps": [],
+        "warnings": [],
+    }
+
+    # 1. What does the driver say is on the GPU right now?
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,process_name,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                try:
+                    pid = int(parts[0])
+                except ValueError:
+                    continue
+                try:
+                    vram_mb = int(parts[2])
+                except ValueError:
+                    vram_mb = None
+                result["gpu_compute_apps"].append({
+                    "pid": pid, "name": parts[1], "vram_mb": vram_mb
+                })
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        result["warnings"].append(f"nvidia-smi compute-apps failed: {e}")
+
+    # 2. Reparented Python/vLLM children — these are the canonical "agent
+    # spawned this, then the agent died but the child kept running" case.
+    try:
+        for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "memory_info"]):
+            try:
+                info = proc.info
+                if info.get("ppid") != 1:
+                    continue
+                cmdline = info.get("cmdline") or []
+                cmd_str = " ".join(cmdline)
+                if not cmd_str:
+                    continue
+                low = cmd_str.lower()
+                if "python" not in low and "vllm" not in low:
+                    continue
+                mem = info.get("memory_info")
+                rss_mb = (mem.rss // (1024 * 1024)) if mem else None
+                result["reparented_python"].append({
+                    "pid": info["pid"],
+                    "cmd": cmd_str[:400],
+                    "rss_mb": rss_mb,
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception as e:
+        result["warnings"].append(f"reparented scan failed: {e}")
+
+    # 3. /dev/shm — vLLM KV-cache shm regions leak here on a crash. On unified
+    # memory (DGX Spark) this is system RAM, so it matters even before any
+    # SysV ipcs entries show up.
+    try:
+        shm_dir = Path("/dev/shm")
+        if shm_dir.exists():
+            for entry in shm_dir.iterdir():
+                try:
+                    st = entry.stat()
+                    result["dev_shm"].append({
+                        "name": entry.name,
+                        "size_bytes": st.st_size,
+                        "size_mb": st.st_size // (1024 * 1024),
+                        "mtime": st.st_mtime,
+                    })
+                except OSError:
+                    continue
+            result["dev_shm"].sort(key=lambda x: x["size_bytes"], reverse=True)
+    except Exception as e:
+        result["warnings"].append(f"/dev/shm scan failed: {e}")
+
+    # 4. SysV shared memory (ipcs -m). Format:
+    #    key  shmid  owner  perms  bytes  nattch  status
+    try:
+        out = subprocess.check_output(
+            ["ipcs", "-m"], timeout=5, stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 6 and parts[0].startswith("0x"):
+                try:
+                    result["sysv_shm"].append({
+                        "key": parts[0],
+                        "shmid": int(parts[1]),
+                        "owner": parts[2],
+                        "bytes": int(parts[4]),
+                        "nattch": int(parts[5]),
+                    })
+                except (ValueError, IndexError):
+                    continue
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
+        result["warnings"].append(f"ipcs failed: {e}")
+
+    # 5. What does the agent THINK is running?
+    try:
+        result["tracked_instances"] = _scan_vllm_instances()
+    except Exception as e:
+        result["warnings"].append(f"instance scan failed: {e}")
+
+    # 6. Cross-reference: any GPU compute app whose PID is not in the agent's
+    # tracked-instance process tree is the actionable signal.
+    tracked_pids: set[int] = set()
+    for inst in result["tracked_instances"]:
+        pid = inst.get("pid")
+        if not pid:
+            continue
+        try:
+            p = psutil.Process(int(pid))
+            tracked_pids.add(p.pid)
+            for child in p.children(recursive=True):
+                tracked_pids.add(child.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            continue
+
+    result["unowned_gpu_compute_apps"] = [
+        app for app in result["gpu_compute_apps"]
+        if app["pid"] not in tracked_pids
+    ]
+
+    return result
 
 
 def _load_library() -> list[dict]:

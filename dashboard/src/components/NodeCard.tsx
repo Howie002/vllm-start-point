@@ -5,6 +5,7 @@ import type { FullStatus, NodeConfig } from "@/lib/types";
 import { createNodeApi, renameNode } from "@/lib/api";
 import { StackConfigs } from "./StackConfigs";
 import { EditNodeModal } from "./EditNodeModal";
+import { DiagnoseModal } from "./DiagnoseModal";
 
 interface Props {
   node: NodeConfig;
@@ -24,6 +25,7 @@ export function NodeCard({ node, status, error, onRefresh, onNodesChanged }: Pro
   const [draft, setDraft]         = useState(node.name);
   const [renamingBusy, setRenamingBusy] = useState(false);
   const [editAddrOpen, setEditAddrOpen] = useState(false);
+  const [diagnoseOpen, setDiagnoseOpen] = useState(false);
 
   async function handleRename() {
     const trimmed = draft.trim();
@@ -176,6 +178,15 @@ export function NodeCard({ node, status, error, onRefresh, onNodesChanged }: Pro
         {online && (
           <div className="flex items-center gap-1 ml-auto" onClick={e => e.stopPropagation()}>
             <button
+              onClick={() => setDiagnoseOpen(true)}
+              disabled={!!agentBusy || !!dashBusy}
+              className="text-xs px-2 py-0.5 rounded text-slate-500 hover:text-amber-400 hover:bg-slate-700/50 disabled:opacity-40 transition-colors"
+              title="Forensic snapshot — orphaned vLLM workers, leaked shm, unowned GPU memory"
+            >
+              Diagnose
+            </button>
+            <span className="text-slate-700 text-xs">|</span>
+            <button
               onClick={handleDashboardRestart}
               disabled={!!dashBusy || !!agentBusy}
               className="text-xs px-2 py-0.5 rounded text-slate-500 hover:text-emerald-400 hover:bg-slate-700/50 disabled:opacity-40 transition-colors"
@@ -225,6 +236,10 @@ export function NodeCard({ node, status, error, onRefresh, onNodesChanged }: Pro
           onClose={() => setEditAddrOpen(false)}
           onSaved={() => onNodesChanged?.()}
         />
+      )}
+
+      {diagnoseOpen && (
+        <DiagnoseModal node={node} onClose={() => setDiagnoseOpen(false)} />
       )}
     </div>
   );

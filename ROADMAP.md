@@ -51,11 +51,14 @@ Operational tasks layered on top of the running cluster. Not code features — h
 
 **Acceptance criteria**
 - [ ] Launch modal shows live status: `Spawning process` → `Loading config` → `Allocating GPU memory` → `Loading weights (X%)` → `Warming up` → `Ready`
-- [ ] Live tail of vLLM stdout/stderr (last ~20 lines) in the launch modal while launching
-- [ ] Failure state surfaces the error with a stderr snippet and a "View full log" link
+- [x] Live tail of vLLM stdout/stderr (last ~20 lines) in the launch modal while launching — `LaunchLogModal` ships in [387086b](387086b)
+- [x] Failure state surfaces the error with a stderr snippet and a "View full log" link — agent's `/instances/launch` now babysits the spawned process for `EARLY_FAIL_WAIT_S` seconds, returns HTTP 422 with structured `{message, exit_code, log_tail, log_path}` on startup crash; `DeployModal` renders the panel inline. *(2026-05-13)*
 - [ ] Cancel button available throughout launch; kills the spawned process and cleans up GPU allocation
 - [ ] If no stdout is observed for >30 s, UI shows `No activity for 30s — last stage: X` so user knows it is not frozen
-- [ ] After launch completes, modal auto-dismisses on success and persists on failure
+- [x] After launch completes, modal auto-dismisses on success and persists on failure — failure path keeps the modal open with the error/log; the success path closes as before. *(2026-05-13)*
+
+**Side-effect of the failure-surfacing work — auto-retry for chunked-MM models**
+When vLLM fails with the specific `Chunked MM input disabled but max_tokens_per_mm_item (N) is larger than max_num_batched_tokens (M)` error (e.g. Gemma-4 multimodal), the agent now parses N out of the log, retries the launch once with `--max-num-batched-tokens=max(N, 4096)`, and surfaces the auto-retry result in the response. Prevents the same silent crash that motivated the failure-surfacing fix from happening on the very next try. *(2026-05-13)*
 
 ---
 
@@ -71,8 +74,8 @@ Operational tasks layered on top of the running cluster. Not code features — h
 Today the only path is to SSH into the node and run `nvidia-smi --query-compute-apps`, `ps --ppid 1`, `ls /dev/shm/`, and `ipcs -m` by hand and cross-reference against the agent's `instances` list.
 
 **Acceptance criteria**
-- [ ] New `/diagnose` route on the agent returns JSON with: GPU compute apps from `nvidia-smi --query-compute-apps=pid,process_name,used_memory`, reparented Python/vLLM processes (`PPID == 1`), `/dev/shm` segments (path, size, mtime), SysV shared-memory segments from `ipcs -m`, and a side-by-side comparison of what the agent's `instances` list owns vs. what's actually allocated
-- [ ] Dashboard surfaces a "Diagnose" action on each node card that calls this route and renders the result, highlighting anything unowned
+- [x] New `/diagnose` route on the agent returns JSON with: GPU compute apps from `nvidia-smi --query-compute-apps=pid,process_name,used_memory`, reparented Python/vLLM processes (`PPID == 1`), `/dev/shm` segments (path, size, mtime), SysV shared-memory segments from `ipcs -m`, and a side-by-side comparison of what the agent's `instances` list owns vs. what's actually allocated — `agent.py @app.get("/diagnose")`. *(2026-05-13)*
+- [x] Dashboard surfaces a "Diagnose" action on each node card that calls this route and renders the result, highlighting anything unowned — `DiagnoseModal` reachable from `NodeCard` header. *(2026-05-13)*
 - [ ] Follow-on: "Reap orphan" action that kills reparented workers and clears unowned shm segments after a confirm dialog (gated behind a setting, since false positives could kill a legitimate process the agent is mid-launching)
 
 ---
