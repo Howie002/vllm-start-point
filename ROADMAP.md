@@ -1,7 +1,7 @@
 # AI Distributed Inference Cluster — Roadmap
 
 **Repo:** [github.com/Howie002/AI-Distributed-Inference-Cluster](https://github.com/Howie002/AI-Distributed-Inference-Cluster) (private, active on `dev`)
-**Last Synced:** 2026-05-07
+**Last Synced:** 2026-05-13
 **Current Phase:** v2 Cluster — operational hardening + analytics follow-on
 **Target Production:** Ongoing operational service
 
@@ -56,6 +56,24 @@ Operational tasks layered on top of the running cluster. Not code features — h
 - [ ] Cancel button available throughout launch; kills the spawned process and cleans up GPU allocation
 - [ ] If no stdout is observed for >30 s, UI shows `No activity for 30s — last stage: X` so user knows it is not frozen
 - [ ] After launch completes, modal auto-dismisses on success and persists on failure
+
+---
+
+### 🟡 No way to forensically diagnose orphaned vLLM workers or RAM leaks during a spike
+
+**Priority:** Medium — needed whenever the agent reports `instances: []` but system RAM or VRAM is still pinned
+**Reported:** 2026-05-13 (post-restart incident on a child node: system RAM spiked to 100% while the agent reported no running instances)
+**Context:** On DGX Spark (GB10) unified-memory hardware GPU and system RAM share the same physical pool, so an allocation the agent has lost track of looks like a system-wide RAM leak. Three known mechanisms can leave allocations un-owned:
+1. **Reparented vLLM workers** — tensor-parallel children reparented to PID 1 when the parent process is `SIGKILL`ed (OOM killer, hard restart). `./node.sh stop` does not kill them because the agent never tracked their PIDs.
+2. **PID-file desync** — vLLM spawned and allocated memory but the agent's tracking file was never written, or was deleted by a concurrent `stop`.
+3. **`/dev/shm` and SysV shm leaks** — KV-cache and IPC shared-memory segments not cleaned up after a crash. On unified memory these directly count as system RAM.
+
+Today the only path is to SSH into the node and run `nvidia-smi --query-compute-apps`, `ps --ppid 1`, `ls /dev/shm/`, and `ipcs -m` by hand and cross-reference against the agent's `instances` list.
+
+**Acceptance criteria**
+- [ ] New `/diagnose` route on the agent returns JSON with: GPU compute apps from `nvidia-smi --query-compute-apps=pid,process_name,used_memory`, reparented Python/vLLM processes (`PPID == 1`), `/dev/shm` segments (path, size, mtime), SysV shared-memory segments from `ipcs -m`, and a side-by-side comparison of what the agent's `instances` list owns vs. what's actually allocated
+- [ ] Dashboard surfaces a "Diagnose" action on each node card that calls this route and renders the result, highlighting anything unowned
+- [ ] Follow-on: "Reap orphan" action that kills reparented workers and clears unowned shm segments after a confirm dialog (gated behind a setting, since false positives could kill a legitimate process the agent is mid-launching)
 
 ---
 
@@ -256,4 +274,4 @@ Small or uncertain items that may not be worth building but are worth rememberin
 
 ---
 
-**Last Updated:** 2026-05-07
+**Last Updated:** 2026-05-13
