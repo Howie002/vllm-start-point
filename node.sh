@@ -170,6 +170,51 @@ install_master_deps() {
     success "Dashboard ready"
 }
 
+# ── Install: lightweight Python venv (no vLLM) for the control agent + proxy ─
+# Master nodes need the agent (so children can POST /proxy/sync) and LiteLLM
+# (the cluster's OpenAI-compatible entry point), but NOT vLLM itself — there's
+# no GPU on a pure-master box. install_child_deps does the heavy vLLM install
+# via setup.sh; this is the slimmer variant for master role.
+install_agent_deps() {
+    header "Installing control-plane Python deps (agent + LiteLLM, no vLLM)"
+
+    if ! command -v python3 &>/dev/null; then
+        bail "python3 not found — install Python 3.10+ first."
+    fi
+    if ! python3 -m venv --help &>/dev/null; then
+        bail "python3-venv not found — run: sudo apt install python3-venv python3-full"
+    fi
+
+    if [ ! -d "$VENV_DIR" ]; then
+        info "Creating venv at $VENV_DIR..."
+        python3 -m venv "$VENV_DIR" || bail "venv creation failed."
+    else
+        info "Reusing existing venv at $VENV_DIR"
+    fi
+
+    info "Upgrading pip..."
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip \
+        || bail "pip upgrade failed."
+
+    info "Installing LiteLLM proxy + agent runtime..."
+    "$VENV_DIR/bin/pip" install --quiet \
+        "litellm[proxy]>=1.83.0" \
+        huggingface_hub \
+        duckdb \
+        psutil \
+        "fastapi>=0.110" \
+        "uvicorn>=0.27" \
+        "pydantic>=2" \
+        httpx \
+        requests \
+        || bail "pip install failed."
+
+    [ -x "$VENV_DIR/bin/litellm" ] \
+        || bail "litellm binary not found at $VENV_DIR/bin/litellm after install."
+
+    success "Control-plane Python deps ready"
+}
+
 # ── Install: Python venv + vLLM + agent deps ─────────────────────────────────
 install_child_deps() {
     header "Installing child (inference) dependencies"
@@ -356,9 +401,12 @@ PY
     fi
     if [[ "${do_install:-Y}" =~ ^[Yy]$ ]] || [ -z "$do_install" ]; then
         case "$role" in
-            master) install_master_deps ;;
+            master)
+                install_master_deps   # Node.js + dashboard build
+                install_agent_deps    # venv + LiteLLM + agent runtime (no vLLM)
+                ;;
             child)
-                install_child_deps
+                install_child_deps    # CUDA + vLLM + agent deps (via setup.sh)
                 install_master_deps   # child also runs the dashboard (to see the full cluster)
                 ;;
             both)
@@ -580,11 +628,14 @@ do_start() {
 
     try_auto_pull
 
-    if [ "$role" = "child" ] || [ "$role" = "both" ]; then
-        info "Starting control agent (port $agent_port)..."
-        AGENT_PORT="$agent_port" AGENT_BIND_IP="$this_ip" bash "$SCRIPT_DIR/agent/start_agent.sh" \
-            || warn "Agent start reported errors — check agent/agent.log"
-    fi
+    # Agent runs on every role. Master needs it so child nodes can POST
+    # /proxy/sync (which triggers _proxy_write_and_restart to regenerate the
+    # LiteLLM config from the current cluster-wide instance set). Without the
+    # agent on master, the proxy is stuck with whatever config it had at
+    # startup and the cluster can't add/remove models dynamically.
+    info "Starting control agent (port $agent_port)..."
+    AGENT_PORT="$agent_port" AGENT_BIND_IP="$this_ip" bash "$SCRIPT_DIR/agent/start_agent.sh" \
+        || warn "Agent start reported errors — check agent/agent.log"
 
     # LiteLLM cluster proxy runs only on master/both — one per cluster, not per node.
     if [ "$role" = "master" ] || [ "$role" = "both" ]; then
@@ -602,9 +653,7 @@ do_start() {
     echo ""
     success "Start sequence complete."
     echo -e "  Dashboard  →  ${CYAN}http://$this_ip:$dashboard_port${RESET}"
-    if [ "$role" != "master" ]; then
-        echo -e "  Agent      →  ${CYAN}http://$this_ip:$agent_port${RESET}"
-    fi
+    echo -e "  Agent      →  ${CYAN}http://$this_ip:$agent_port${RESET}"
     local proxy_ip proxy_port
     proxy_ip=$(cfg_get "['cluster_proxy']['ip']" "$master_ip")
     proxy_port=$(cfg_get "['cluster_proxy']['port']" "4000")
