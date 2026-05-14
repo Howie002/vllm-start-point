@@ -399,6 +399,109 @@ def _proxy_alive() -> bool:
         return False
 
 
+# ── VRAM reclaim ──────────────────────────────────────────────────────────────
+#
+# A crashed vLLM leaves behind GPU memory that nvidia-smi can't always pin to
+# a live PID. Common sources:
+#   1. EngineCore subprocess that outlived its parent api_server
+#   2. Multiprocessing semaphores in /dev/shm holding CUDA contexts alive
+#   3. Driver-side pool caching (only nvidia-smi --gpu-reset or reboot frees)
+#
+# On unified-memory hardware (DGX Spark GB10) this is system RAM, not just
+# VRAM, so the leak can starve the next launch attempt (or the whole box).
+# This helper runs the safe reclaim steps before a launch — kill recognized
+# vLLM stragglers and wipe their shm leftovers. It deliberately does NOT call
+# nvidia-smi --gpu-reset (needs sudo and can fail mid-flight) and never raises;
+# launches proceed even if reclaim is partial. The watchdog logs how much was
+# reclaimed so an operator can spot when a node needs a reboot.
+
+# Process-name fragments we recognize as our own vLLM stragglers. Anything
+# else on the GPU (gnome-remote-desktop, X server, NCCL helpers from other
+# users) is left alone.
+_VLLM_PROCESS_FRAGMENTS = ("vllm", "VLLM", "EngineCore", "multiprocessing")
+
+
+def _reclaim_vram_before_launch(target_gpu_indices: list[int]) -> dict:
+    """Best-effort pre-launch cleanup. Returns a dict describing what was
+    reclaimed; callers should log this but never fail on it."""
+    result = {
+        "killed_pids": [],
+        "removed_shm": 0,
+        "vram_freed_mb": None,
+    }
+    try:
+        # Snapshot of GPU compute apps + tracked instances. Tracked PIDs are
+        # off-limits even if they happen to match the name fragments above.
+        uuid_to_idx = _gpu_uuid_to_idx()
+        target_uuids = {u for u, i in uuid_to_idx.items() if i in target_gpu_indices}
+        compute_apps = _compute_apps_snapshot()
+        tracked_pids: set[int] = set()
+        for inst in _scan_vllm_instances():
+            try:
+                tracked_pids.add(int(inst.get("pid", 0)))
+            except (TypeError, ValueError):
+                pass
+
+        # VRAM baseline
+        try:
+            raw = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            baseline_mb = sum(int(line.strip()) for line in raw.splitlines() if line.strip().isdigit())
+        except Exception:
+            baseline_mb = None
+
+        # Kill stragglers
+        for pid, gpu_uuid, _vram in compute_apps:
+            if pid in tracked_pids:
+                continue
+            if target_uuids and gpu_uuid not in target_uuids:
+                continue  # don't touch a different GPU's processes
+            try:
+                proc = psutil.Process(pid)
+                name = proc.name() + " " + " ".join(proc.cmdline()[:3])
+            except Exception:
+                continue
+            if not any(frag in name for frag in _VLLM_PROCESS_FRAGMENTS):
+                continue
+            # Recognized straggler — kill it.
+            try:
+                os.kill(pid, signal.SIGKILL)
+                result["killed_pids"].append(pid)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
+        # Wipe multiprocessing semaphores left by dead CUDA workers
+        for path in Path("/dev/shm").glob("sem.mp-*"):
+            try:
+                path.unlink()
+                result["removed_shm"] += 1
+            except Exception:
+                pass
+
+        # Give the kernel + driver a moment to reclaim
+        if result["killed_pids"] or result["removed_shm"]:
+            time.sleep(2)
+
+        # Measure VRAM reclaimed
+        if baseline_mb is not None:
+            try:
+                raw = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout
+                after_mb = sum(int(line.strip()) for line in raw.splitlines() if line.strip().isdigit())
+                result["vram_freed_mb"] = max(0, baseline_mb - after_mb)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return result
+
+
 def _proxy_cleanup_loop():
     """Background loop on master/both nodes — periodically reconciles the
     proxy's cluster_config.yaml against the live (served_name, ip, port) set
@@ -857,6 +960,16 @@ def launch_instance(req: LaunchRequest):
 
     env = {**CUDA_ENV, "CUDA_VISIBLE_DEVICES": gpu_str}
 
+    # Pre-launch VRAM reclaim: kill orphan vLLM stragglers on the target GPU(s)
+    # and clear leftover multiprocessing semaphores. A crashed vLLM frequently
+    # leaves both behind, and on unified-memory hardware (GB10) that lost
+    # memory can starve the next launch attempt. Best-effort — never fails the
+    # launch on its own. Gated off by setting pre_launch_vram_cleanup=false in
+    # node_config.json.
+    reclaim = None
+    if _NODE_CFG.get("pre_launch_vram_cleanup", True):
+        reclaim = _reclaim_vram_before_launch(req.gpu_indices)
+
     cmd = _build_vllm_cmd(req, flags)
     proc = _spawn_vllm(cmd, env, log_path)
 
@@ -911,6 +1024,17 @@ def launch_instance(req: LaunchRequest):
             daemon=True,
         ).start()
 
+    # Record intent so the watchdog can auto-restart this instance if it dies
+    # later. We persist the exact launch request — model, served_name, port,
+    # GPUs, and any flags (including the auto-retry'd max_num_batched_tokens
+    # bump if that fired) — so restarts come back identically configured.
+    persisted_flags = dict(flags)
+    if auto_retry is not None and "max_num_batched_tokens" in flags:
+        # The chunked-MM bump should stick for future restarts of the same
+        # instance, since the underlying multimodal config doesn't change.
+        persisted_flags["max_num_batched_tokens"] = flags["max_num_batched_tokens"]
+    _intent_record(req, persisted_flags)
+
     response = {
         "pid": proc.pid,
         "port": req.port,
@@ -920,6 +1044,8 @@ def launch_instance(req: LaunchRequest):
     }
     if auto_retry is not None:
         response["auto_retry"] = auto_retry
+    if reclaim is not None and (reclaim["killed_pids"] or reclaim["removed_shm"]):
+        response["pre_launch_reclaim"] = reclaim
     return response
 
 
@@ -954,6 +1080,13 @@ def stop_instance(port: int, deregister: bool = True):
 
     # Process is gone; reset the hot cache so /status reflects it right away.
     _HOT_CACHE.invalidate("full_status", "compute_apps")
+
+    # Intentional stop — drop intent so the watchdog doesn't try to bring it
+    # back. Only the deregister=True path is treated as "intentional"; an
+    # internal stop with deregister=False (e.g. preparing for a relaunch)
+    # leaves intent in place.
+    if deregister:
+        _intent_forget(port=port)
 
     # Update proxy config to remove stopped instance
     if deregister and served_name:
@@ -2160,6 +2293,148 @@ def get_full_status():
     return _HOT_CACHE.get_or_compute("full_status", STATUS_CACHE_TTL_S, _compute_full_status)
 
 
+# ── Intended-instance tracking + auto-restart watchdog ──────────────────────
+# When /instances/launch succeeds, we persist the launch request to
+# data/intended_instances.json so the watchdog knows "this instance SHOULD
+# be running on this node." If the watchdog scan shows a known-intended
+# instance is missing (vLLM crashed, OOM-killed, segfaulted), it calls
+# /instances/launch again with the saved params — VRAM is reclaimed in that
+# launch path, so a crashed-and-leaked GPU can self-heal.
+#
+# Persistence is per-node (each child owns its own intent file). On agent
+# restart, the watchdog re-reads the file and reconciles. Stop via DELETE
+# /instances/{port} clears intent so deliberately-stopped models stay stopped.
+#
+# Gated by `auto_restart_failed_instances` in node_config.json (default true).
+
+_INTENT_PATH = Path(__file__).parent.parent / "data" / "intended_instances.json"
+_INTENT_LOCK = threading.Lock()
+
+# Backoff schedule for restart attempts after the watchdog detects a missing
+# instance. After the last value, the instance is marked "abandoned" and the
+# watchdog stops trying until an operator manually re-launches or clears it.
+_RESTART_BACKOFF_S = [30, 120, 600]
+
+# In-memory state about restart attempts: maps port → {"attempts": N,
+# "next_at": epoch_seconds, "abandoned": bool}. Kept in-memory because the
+# backoff resets on agent restart (that's a fresh chance to recover).
+_RESTART_STATE: dict[int, dict] = {}
+_RESTART_STATE_LOCK = threading.Lock()
+
+
+def _intent_load() -> list[dict]:
+    """Read the persisted intent list. Empty list if the file is missing or
+    malformed — never raises."""
+    try:
+        if _INTENT_PATH.exists():
+            return json.loads(_INTENT_PATH.read_text()) or []
+    except Exception:
+        pass
+    return []
+
+
+def _intent_save(records: list[dict]) -> None:
+    try:
+        _INTENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _INTENT_PATH.write_text(json.dumps(records, indent=2))
+    except Exception:
+        pass
+
+
+def _intent_record(req: LaunchRequest, flags: dict) -> None:
+    """Persist a successful launch as 'intended'. Keyed by port — re-launching
+    the same port replaces the prior record (same model, possibly different
+    flags after auto-retry)."""
+    with _INTENT_LOCK:
+        records = [r for r in _intent_load() if r.get("port") != req.port]
+        records.append({
+            "model_id": req.model_id,
+            "served_name": req.served_name,
+            "gpu_indices": list(req.gpu_indices),
+            "port": req.port,
+            "register_with_proxy": req.register_with_proxy,
+            "extra_flags": flags,
+            "recorded_at": int(time.time()),
+        })
+        _intent_save(records)
+    # Reset any prior backoff state for this port — a fresh launch is a fresh
+    # chance.
+    with _RESTART_STATE_LOCK:
+        _RESTART_STATE.pop(req.port, None)
+
+
+def _intent_forget(port: int) -> None:
+    """Remove an instance from the intent list (called on intentional stop)."""
+    with _INTENT_LOCK:
+        records = [r for r in _intent_load() if r.get("port") != port]
+        _intent_save(records)
+    with _RESTART_STATE_LOCK:
+        _RESTART_STATE.pop(port, None)
+
+
+def _instance_watchdog_loop():
+    """Background loop: every 30s, compare intended instances vs what's actually
+    running. For missing intended instances, attempt /instances/launch with the
+    saved params, with backoff. Best-effort; never raises."""
+    # Brief initial delay so we don't fight the startup re-register path.
+    time.sleep(45)
+    while True:
+        try:
+            _instance_watchdog_tick()
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+def _instance_watchdog_tick() -> None:
+    intent = _intent_load()
+    if not intent:
+        return
+    running_ports = {inst.get("port") for inst in _scan_vllm_instances() if inst.get("port")}
+    now = time.time()
+    for record in intent:
+        port = record.get("port")
+        if not port or port in running_ports:
+            # Either malformed or healthy — clear any restart state on success.
+            if port:
+                with _RESTART_STATE_LOCK:
+                    _RESTART_STATE.pop(port, None)
+            continue
+
+        # Missing. Check backoff.
+        with _RESTART_STATE_LOCK:
+            state = _RESTART_STATE.setdefault(port, {"attempts": 0, "next_at": now, "abandoned": False})
+            if state["abandoned"] or now < state["next_at"]:
+                continue
+            attempt = state["attempts"]
+            state["attempts"] = attempt + 1
+            # Schedule the next retry now, in case this attempt also fails.
+            if attempt < len(_RESTART_BACKOFF_S):
+                state["next_at"] = now + _RESTART_BACKOFF_S[attempt]
+            else:
+                state["abandoned"] = True
+                # No further attempts — operator action needed.
+                continue
+
+        # Attempt the relaunch. We call launch_instance() directly rather than
+        # round-tripping through HTTP — it's the same process, same flags. The
+        # function does its own pre-launch VRAM reclaim.
+        try:
+            req = LaunchRequest(
+                model_id=record["model_id"],
+                gpu_indices=record.get("gpu_indices", []),
+                port=port,
+                served_name=record["served_name"],
+                register_with_proxy=record.get("register_with_proxy", True),
+                extra_flags=record.get("extra_flags", {}),
+            )
+            launch_instance(req)
+        except Exception:
+            # Failure is fine — backoff was already scheduled above. The
+            # operator can inspect via dashboard / /status if it stays down.
+            pass
+
+
 # ── Startup re-registration ───────────────────────────────────────────────────
 # When this agent (re)starts, any vLLM instances that were left running need to
 # be re-registered with the cluster proxy. Otherwise a proxy restart or a stale
@@ -2187,6 +2462,13 @@ def _on_startup():
     # to reconcile and would just spam the master with /proxy/sync requests.
     if _NODE_CFG.get("role", "") in ("master", "both"):
         threading.Thread(target=_proxy_cleanup_loop, daemon=True).start()
+    # Per-node watchdog: re-launches instances that died unexpectedly. Tracks
+    # intent locally so each node owns its own recovery — no master required.
+    # Master role itself doesn't typically host vLLM instances, but the loop
+    # is cheap if data/intended_instances.json is empty, and turning it on
+    # for "both" role is the only path that matters in practice.
+    if _NODE_CFG.get("auto_restart_failed_instances", True):
+        threading.Thread(target=_instance_watchdog_loop, daemon=True).start()
 
     # Start the per-node metrics sampler. Uses the currently registered node
     # name from node_config.json so JSONL rows are self-describing across
